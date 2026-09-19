@@ -197,7 +197,7 @@ async def control[T, U](
 
 `await handle.cancel()` requests task cancellation; `await run.cancel()` cancels the entire run. Acknowledgment means the command has been processed. Await the handle or run for actual completion. Running tasks pass through CANCELLING, and resources are released only after Runner confirms execution has stopped. Thread functions cannot be forcibly terminated, so cancellation waits for them to exit. Async functions can perform cleanup in `finally`.
 
-**Agent calls and structured output.** An `@agent` function returns a prompt, while its task returns the decoded and validated result. Definitions can specify result_type, a business check, and a retry policy:
+**Agent calls and structured output.** An `@agent` function returns a prompt, while its task returns the decoded and validated result. Every agent must explicitly specify `backend`: either a name registered in the runtime's `backends` mapping or an `AgentBackend` instance. Omitting it is an error during definition and static type checking. Definitions can also specify result_type, a business check, and a retry policy:
 
 ```python
 from dataclasses import dataclass

@@ -4,11 +4,12 @@ import os
 import sys
 import tempfile
 import unittest
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
-from orchlet import AgentBackend, EventLoopRuntime, FlowContext, TaskHandle, agent, flow
+from orchlet import AgentBackend, EventLoopRuntime, FlowContext, TaskDef, TaskHandle, agent, flow
 from orchlet.backends import CodexBackend, CommandBackend
 from orchlet.contracts import Emit
 from orchlet.errors import (
@@ -42,7 +43,45 @@ class ScriptedBackend(AgentBackend):
         return AgentReply(next(self.responses))
 
 
+class AgentDefinitionTests(unittest.TestCase):
+    def test_backend_is_required_for_decorators_and_direct_calls(self):
+        def prompt() -> str:
+            return "Return a rating."
+
+        # Bypass static checking to verify that dynamic callers also fail immediately.
+        define_agent = cast(Callable[..., object], agent)
+        for function in (None, prompt):
+            for structured in (False, True):
+                options: dict[str, object] = {"result_type": Rating} if structured else {}
+                with self.subTest(function=function, structured=structured):
+                    with self.assertRaisesRegex(TypeError, "backend"):
+                        define_agent(function, **options)
+
+    def test_low_level_agent_definitions_require_a_backend(self):
+        def prompt() -> str:
+            return "Review the code."
+
+        with self.assertRaisesRegex(TypeError, "backend"):
+            cast(Callable[..., object], TaskDef)(function=prompt, name="review", kind="agent")
+        with self.assertRaisesRegex(ValueError, "explicit backend"):
+            TaskDef[[], str](function=prompt, name="review", kind="agent", backend=None)
+
+
 class AgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_backend_instance_needs_no_runtime_registration(self):
+        backend = ScriptedBackend(['{"singer":"A","score":8}'])
+
+        @agent(backend=backend, result_type=Rating)
+        def rate():
+            return "Rate singer A."
+
+        @flow
+        async def pipeline(ctx: FlowContext):
+            return await ctx.submit(rate)
+
+        self.assertEqual(await EventLoopRuntime().arun(pipeline), Rating("A", 8.0))
+        self.assertEqual(backend.requests[0].prompt, "Rate singer A.")
+
     async def test_structured_output_and_repair_feedback(self):
         backend = ScriptedBackend(
             ["not json", '{"singer":"A", "score":99}', '{"singer":"A", "score":8}']

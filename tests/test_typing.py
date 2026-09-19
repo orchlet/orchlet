@@ -41,15 +41,31 @@ class Rating:
 async def number(value: int):
     return value + 1
 
-@agent(result_type=Rating)
+@agent(backend="test", result_type=Rating)
 def rate():
     return "Return a rating."
 
-@agent(result_type=Rating)  # reject: reportArgumentType
+@agent(backend="test", result_type=Rating)  # reject: reportArgumentType
 def invalid_prompt():
     return 123
 
-agent(result_type=Rating, validate=lambda rating: rating.missing)  # reject: reportAttributeAccessIssue
+agent(
+    backend="test", result_type=Rating,
+    validate=lambda rating: rating.missing,  # reject: reportAttributeAccessIssue
+)
+
+@agent  # reject: reportCallIssue
+def missing_backend():
+    return "Review the code."
+
+def prompt() -> str:
+    return "Return a rating."
+
+agent()  # reject: reportCallIssue
+agent(prompt)  # reject: reportCallIssue
+agent(result_type=Rating)  # reject: reportCallIssue
+agent(prompt, result_type=Rating)  # reject: reportCallIssue
+agent(backend=None)  # reject: reportArgumentType
 
 @flow
 async def child(ctx: FlowContext, value: int):

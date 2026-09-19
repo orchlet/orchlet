@@ -65,42 +65,46 @@ def parse_values(ctx: TaskContext):
     return [1, 2]
 
 
-@agent
+@agent(backend="test")
 def review(value: str):
     return f"Review {value}."
 
 
-@agent(validate=lambda text: "LGTM" in assert_type(text, str))
+@agent(backend="test", validate=lambda text: "LGTM" in assert_type(text, str))
 async def async_review(value: str):
     return f"Review {value}."
 
 
-@agent(result_type=Rating, validate=lambda rating: assert_type(rating, Rating).score >= 0)
+@agent(
+    backend="test",
+    result_type=Rating,
+    validate=lambda rating: assert_type(rating, Rating).score >= 0,
+)
 def rate(singer: str):
     return f"Rate {singer}."
 
 
-@agent(result_type=list[str])
+@agent(backend="test", result_type=list[str])
 def names():
     return "Return singer names."
 
 
-@agent(result_type=dict[str, int])
+@agent(backend="test", result_type=dict[str, int])
 def counts():
     return "Return counts."
 
 
-@agent(result_type=Rating | None)
+@agent(backend="test", result_type=Rating | None)
 def optional_rating():
     return "Return a rating or null."
 
 
-@agent(result_type=Literal["pass", "fail"])
+@agent(backend="test", result_type=Literal["pass", "fail"])
 def verdict():
     return "Return pass or fail."
 
 
-@agent(result_type=Annotated[int, "score"])
+@agent(backend="test", result_type=Annotated[int, "score"])
 def score():
     return "Return a score."
 

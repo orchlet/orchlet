@@ -30,12 +30,12 @@ class Rating:
     reason: str
 
 
-@agent(result_type=list[str], priority=30)
+@agent(backend="codex", result_type=list[str], priority=30)
 def generate_singers(count: int) -> str:
     return f"List {count} singers. Return only a JSON array of strings, using English names."
 
 
-@agent(result_type=Rating, priority=10, validate=lambda r: 0 <= r.score <= 10)
+@agent(backend="codex", result_type=Rating, priority=10, validate=lambda r: 0 <= r.score <= 10)
 def rate_singer(singer: str) -> str:
     return (
         f"Rate singer {singer}. Return a JSON object with singer, score (0 to 10), and reason. "

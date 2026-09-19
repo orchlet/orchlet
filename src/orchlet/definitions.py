@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from .runtime import FlowContext
 
 
-class _TaskOptions(TypedDict, total=False):
+class _CommonOptions(TypedDict, total=False):
     name: str
     kind: str
     priority: Any
@@ -45,10 +45,13 @@ class _TaskOptions(TypedDict, total=False):
     metadata: Mapping[str, Any]
     retry: RetryPolicy | None
     timeout: float | None
-    backend: str | AgentBackend
     codec: OutputCodec[Any] | None
     prompt_builder: PromptBuilder | None
     session: SessionPolicy | None
+
+
+class _TaskOptions(_CommonOptions, total=False):
+    backend: str | AgentBackend
 
 
 class _DefinitionOptions(_TaskOptions, total=False):
@@ -69,13 +72,16 @@ class TaskDef[**P, T_co]:
     retry: RetryPolicy | None = None
     timeout: float | None = None
     validator: ResultValidator[Any] | None = None
-    backend: str | AgentBackend = "codex"
+    # Python tasks explicitly use None; agents must select a backend.
+    backend: str | AgentBackend | None = field(kw_only=True)
     codec: OutputCodec[Any] | None = None
     prompt_builder: PromptBuilder | None = None
     session: SessionPolicy | None = None
     context: bool = False
 
     def __post_init__(self) -> None:
+        if self.kind == "agent" and self.backend is None:
+            raise ValueError("Agent definitions require an explicit backend")
         if self.timeout is not None and (not math.isfinite(self.timeout) or self.timeout <= 0):
             raise ValueError("timeout must be positive and finite")
         object.__setattr__(self, "resources", freeze(self.resources))
@@ -260,6 +266,7 @@ def task(
         return TaskDef(
             function=fn,
             name=values.pop("name", fn.__name__),
+            backend=values.pop("backend", None),
             context=context,
             validator=_validator(result_type, validate),
             **values,
@@ -276,42 +283,47 @@ class _AgentDecorator[T_co](Protocol):
 def agent[**P, T](
     function: Callable[P, str | Awaitable[str]],
     *,
+    backend: str | AgentBackend,
     result_type: TypeForm[T],
     validate: ResultValidator[T] | Callable[[T], object] | None = None,
-    **options: Unpack[_TaskOptions],
+    **options: Unpack[_CommonOptions],
 ) -> TaskDef[P, T]: ...
 @overload
 def agent[**P](
     function: Callable[P, str | Awaitable[str]],
     *,
+    backend: str | AgentBackend,
     result_type: TypeForm[str] = str,
     validate: ResultValidator[str] | Callable[[str], object] | None = None,
-    **options: Unpack[_TaskOptions],
+    **options: Unpack[_CommonOptions],
 ) -> TaskDef[P, str]: ...
 @overload
 def agent[T](
     function: None = None,
     *,
+    backend: str | AgentBackend,
     result_type: TypeForm[T],
     validate: ResultValidator[T] | Callable[[T], object] | None = None,
-    **options: Unpack[_TaskOptions],
+    **options: Unpack[_CommonOptions],
 ) -> _AgentDecorator[T]: ...
 @overload
 def agent(
     function: None = None,
     *,
+    backend: str | AgentBackend,
     result_type: TypeForm[str] = str,
     validate: ResultValidator[str] | Callable[[str], object] | None = None,
-    **options: Unpack[_TaskOptions],
+    **options: Unpack[_CommonOptions],
 ) -> _AgentDecorator[str]: ...
 
 
 def agent(
     function: Callable[..., Any] | None = None,
     *,
+    backend: str | AgentBackend,
     result_type: Any = str,
     validate: ResultValidator[Any] | Callable[[Any], object] | None = None,
-    **options: Unpack[_TaskOptions],
+    **options: Unpack[_CommonOptions],
 ) -> Any:
     def decorate(fn: Callable[..., Any]) -> TaskDef[..., Any]:
         defaults: dict[str, Any] = {
@@ -324,6 +336,7 @@ def agent(
         return TaskDef(
             function=fn,
             name=defaults.pop("name", fn.__name__),
+            backend=backend,
             validator=_validator(result_type, validate),
             **defaults,
         )
