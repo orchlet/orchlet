@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Mapping, cast
 
@@ -152,12 +153,46 @@ class RetryDecision:
 
 
 @dataclass(frozen=True)
+class AttemptArtifacts:
+    directory: Path
+
+    @property
+    def prompt_txt(self) -> Path:
+        return self.directory / "prompt.txt"
+
+    @property
+    def stdout_log(self) -> Path:
+        return self.directory / "stdout.log"
+
+    @property
+    def stderr_log(self) -> Path:
+        return self.directory / "stderr.log"
+
+    @property
+    def output_txt(self) -> Path:
+        return self.directory / "output.txt"
+
+    @property
+    def launch_json(self) -> Path:
+        return self.directory / "launch.json"
+
+    @property
+    def result_json(self) -> Path:
+        return self.directory / "result.json"
+
+
+@dataclass(frozen=True)
 class Attempt:
     number: int
     started_at: float
     finished_at: float
     error: str | None = None
     raw_text: str | None = None
+    stdout: str = ""
+    stderr: str = ""
+    session_id: str | None = None
+    exit_code: int | None = None
+    artifacts: AttemptArtifacts | None = None
 
 
 @dataclass(frozen=True)
@@ -169,6 +204,8 @@ class TaskResult[T_co]:
     stderr: str = ""
     session_id: str | None = None
     error: BaseException | None = None
+    artifacts: AttemptArtifacts | None = None
+    exit_code: int | None = None
 
 
 @dataclass(frozen=True)
@@ -178,6 +215,7 @@ class ExecutionResult[T_co]:
     stdout: str = ""
     stderr: str = ""
     session_id: str | None = None
+    exit_code: int | None = None
 
 
 @dataclass(frozen=True)
@@ -197,6 +235,7 @@ class AgentReply:
     stdout: str = ""
     stderr: str = ""
     session_id: str | None = None
+    exit_code: int | None = None
 
 
 @dataclass(frozen=True)
@@ -205,6 +244,7 @@ class AgentRequest:
     task_id: str
     attempt: int
     session_id: str | None = None
+    artifacts: AttemptArtifacts | None = None
 
 
 @dataclass(frozen=True)
@@ -223,3 +263,4 @@ class ExecutionRequest:
     kwargs: Mapping[str, Any]
     attempt: AttemptContext
     clock: Clock
+    artifacts: AttemptArtifacts | None = None

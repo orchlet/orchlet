@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from .artifacts import write_json, write_text
 from .contracts import AgentBackend, Emit, Runner
 from .errors import ConfigurationError, OutputValidationError, TaskCancelled
 from .models import AgentRequest, ExecutionRequest, ExecutionResult
@@ -122,20 +123,48 @@ class AgentRunner(Runner):
             request.kwargs,
             request.attempt,
         )
+        if request.artifacts is not None:
+            await write_text(request.artifacts.prompt_txt, prompt)
+            await write_json(
+                request.artifacts.launch_json,
+                {
+                    "backend": f"{type(backend).__module__}.{type(backend).__qualname__}",
+                    "session_id": session_id,
+                    "attempt": request.attempt.number,
+                },
+            )
         if cancellation.requested:
             raise TaskCancelled("Cancelled while preparing agent prompt")
         reply = await backend.run_turn(
-            AgentRequest(prompt, request.task_id, request.attempt.number, session_id),
+            AgentRequest(
+                prompt, request.task_id, request.attempt.number, session_id, request.artifacts
+            ),
             emit,
             cancellation,
         )
+        if request.artifacts is not None:
+            artifacts = request.artifacts
+            await write_text(artifacts.output_txt, reply.text)
+            if not artifacts.stdout_log.exists():
+                await write_text(artifacts.stdout_log, reply.stdout)
+            if not artifacts.stderr_log.exists():
+                await write_text(artifacts.stderr_log, reply.stderr)
         try:
             value = definition.codec.decode(reply.text)
             if definition.validator is not None:
                 value = definition.validator.validate(value, request.attempt)
         except Exception as exc:
-            raise OutputValidationError(str(exc), reply.text) from exc
-        return ExecutionResult(value, reply.text, reply.stdout, reply.stderr, reply.session_id)
+            raise OutputValidationError(
+                str(exc),
+                reply.text,
+                stdout=reply.stdout,
+                stderr=reply.stderr,
+                session_id=reply.session_id,
+                exit_code=reply.exit_code,
+            ) from exc
+        return ExecutionResult(
+            value, reply.text, reply.stdout, reply.stderr, reply.session_id, reply.exit_code
+        )
 
 
 class SimulatedRunner(Runner):

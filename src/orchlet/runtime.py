@@ -6,17 +6,35 @@ import asyncio
 import contextvars
 import itertools
 import math
-import uuid
+import sys
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from types import TracebackType
+from urllib.parse import quote
 from typing import Any, Concatenate, Self, cast
 
 from ._bridges import Completion, RuntimeBridge
+from .artifacts import (
+    FileArtifactStore,
+    atomic_write,
+    attempt_metadata,
+    json_bytes,
+    read_json,
+    read_text,
+    result_metadata,
+    write_json,
+    write_text,
+)
+from .checkpoints import PickleCheckpointCodec, callable_identity, fingerprint
 from .clocks import MonotonicClock
 from .contracts import (
     AdmissionPolicy,
     AgentBackend,
+    ArtifactStore,
+    CheckpointCodec,
     Clock,
     DependencyPolicy,
     EventJournal,
@@ -37,6 +55,7 @@ from .errors import (
     ConfigurationError,
     DependencyFailed,
     RunClosedError,
+    RecoveryError,
     SchedulingError,
     TaskCancelled,
     TaskFailed,
@@ -47,6 +66,7 @@ from .inputs import NestedInputResolver
 from .logging import log_event, log_runtime_error
 from .models import (
     Attempt,
+    AttemptArtifacts,
     AttemptContext,
     ExecutionRequest,
     ExecutionResult,
@@ -116,6 +136,10 @@ class _Record:
     timed_out: bool = False
     result: TaskResult[Any] | None = None
     error: BaseException | None = None
+    signature: str = ""
+    cached: dict[str, Any] | None = None
+    resolved_signature: str | None = None
+    value_digest: str | None = None
 
     def view(self) -> TaskView:
         resources = dict(self.definition.resources)
@@ -173,6 +197,10 @@ class FlowContext:
         self._runtime = runtime
         self.run_id: str = run_id
         self.scope_id: str = scope_id
+
+    @property
+    def artifacts_dir(self) -> Path:
+        return self._runtime.artifacts.run_dir(self.run_id)
 
     def _check(self) -> None:
         if _current_scope.get() != self.scope_id:
@@ -267,6 +295,20 @@ class FlowContext:
 
 
 class EventLoopRuntime(Runtime):
+    """Execute flows with local checkpoints and automatic continuation by default.
+
+    Repeating a command with the same flow and explicit inputs opens its unfinished
+    run. Successful tasks return their checkpointed values; failed or interrupted
+    tasks get a new attempt. Completed runs start fresh. Pass resume=False to
+    deliberately start over, or run_key to name an invocation independently of argv.
+
+    Controllers run again to reconstruct dynamic submissions. Keep their order
+    deterministic, pass changing data as explicit inputs, and put side effects in
+    tasks that tolerate interrupted execution. External submissions to keep_open
+    runs must be submitted again by the caller. Results must support the selected
+    CheckpointCodec; the default pickle codec requires trusted local run files.
+    """
+
     def __init__(
         self,
         *,
@@ -284,6 +326,10 @@ class EventLoopRuntime(Runtime):
         journal: EventJournal | None = None,
         transport: EventTransport[_Message] | None = None,
         clock: Clock | None = None,
+        artifacts: ArtifactStore | None = None,
+        checkpoint_codec: CheckpointCodec | None = None,
+        resume: bool = True,
+        run_key: str | None = None,
     ) -> None:
         if concurrency is not None and resources is not None:
             raise ConfigurationError("Pass concurrency or resources, not both")
@@ -308,6 +354,16 @@ class EventLoopRuntime(Runtime):
             transport if transport is not None else AsyncioEventTransport()
         )
         self.clock: Clock = clock if clock is not None else MonotonicClock()
+        self.artifacts: ArtifactStore = artifacts if artifacts is not None else FileArtifactStore()
+        self.checkpoint_codec: CheckpointCodec = (
+            checkpoint_codec if checkpoint_codec is not None else PickleCheckpointCodec()
+        )
+        self.resume: bool = resume
+        self.run_key: str | None = run_key
+        self._run_metadata: dict[str, dict[str, Any]] = {}
+        self._resumed: set[str] = set()
+        self._invocations: dict[str, int] = {}
+        self._sequences: dict[str, int] = {}
         self.runners: dict[str, Runner] = {
             "python": PythonRunner(),
             "agent": AgentRunner(backends or {}),
@@ -331,6 +387,7 @@ class EventLoopRuntime(Runtime):
             self.result_details,
             self._completions.__getitem__,
             self._admissions.__getitem__,
+            self.artifacts,
         )
         self._runs: dict[str, _Run] = {}
         self._run_handles: dict[str, RunHandle[Any]] = {}
@@ -340,7 +397,6 @@ class EventLoopRuntime(Runtime):
         self._dirty: dict[str, None] = {}
         self._pending: dict[str, int] = {}
         self._acks: set[asyncio.Future[None]] = set()
-        self._sequence = itertools.count(1)
         self._ready_sequence = itertools.count(1)
         self._event_sequence = max((e.sequence for e in self.journal.read()), default=0)
         self._policy_timer: Timer | None = None
@@ -396,8 +452,58 @@ class EventLoopRuntime(Runtime):
             if isinstance(flow, FlowDef)
             else FlowDef[..., T](CoroutineFlowController[..., T](flow), flow.__name__)
         )
-        self._ensure_engine()
-        run_id = uuid.uuid4().hex[:12]
+        controller = definition.controller
+        function = (
+            controller.function if isinstance(controller, CoroutineFlowController) else controller
+        )
+        identity = callable_identity(function)
+        signature = fingerprint((definition.name, identity, args, kwargs, keep_open))
+        key = self.run_key or fingerprint((str(Path.cwd()), sys.argv, identity[:2], args, kwargs))
+        invocation = self._invocations.get(key, 0)
+        run_id, resumed = self.artifacts.open_run(f"{key}:{invocation}", resume=self.resume)
+        try:
+            path = self.artifacts.run_dir(run_id) / "run.json"
+            metadata = read_json(path) if resumed and path.exists() else {}
+            if metadata and (metadata.get("format") != 1 or metadata.get("signature") != signature):
+                raise RecoveryError(
+                    "The saved flow or its inputs have changed; use resume=False to start a new run"
+                )
+            now = datetime.now(timezone.utc).isoformat()
+            metadata.update(
+                {
+                    "format": 1,
+                    "run_id": run_id,
+                    "flow": definition.name,
+                    "signature": signature,
+                    "inputs": (args, kwargs),
+                    "status": "running",
+                    "created_at": metadata.get("created_at", now),
+                    "updated_at": now,
+                    "resumed": resumed,
+                    "error": None,
+                    "python": list(sys.version_info[:2]),
+                }
+            )
+            atomic_write(path, json_bytes(metadata))
+            self._run_metadata[run_id] = metadata
+            if resumed:
+                self._resumed.add(run_id)
+                events = self.artifacts.run_dir(run_id) / "events.jsonl"
+                if events.exists():
+                    import json
+
+                    for line in events.read_text().splitlines():
+                        try:
+                            self._event_sequence = max(
+                                self._event_sequence, int(json.loads(line)["sequence"])
+                            )
+                        except ValueError, KeyError:
+                            continue  # A killed writer may leave one incomplete event line.
+            self._ensure_engine()
+        except BaseException:
+            self.artifacts.close_run(run_id)
+            raise
+        self._invocations[key] = invocation + 1
         completion = Completion[T](quiet_future(asyncio.get_running_loop().create_future()))
         self._completions[run_id] = completion
         handle = RunHandle[T](self._bridge, run_id, completion)
@@ -477,7 +583,7 @@ class EventLoopRuntime(Runtime):
                     raise ValueError("Unknown or cross-run input reference")
             else:
                 raise TypeError("Control dependencies must be TaskHandles")
-        task_id = f"{run_id}/{next(self._sequence)}:{definition.name}"
+        task_id = self._next_id(scope_id or f"{run_id}/external", "task", definition.name)
         completion = Completion[T](quiet_future(asyncio.get_running_loop().create_future()))
         admitted: asyncio.Future[None] = quiet_future(asyncio.get_running_loop().create_future())
         self._completions[task_id] = completion
@@ -514,7 +620,7 @@ class EventLoopRuntime(Runtime):
             if isinstance(definition, FlowDef)
             else FlowDef[..., T](CoroutineFlowController[..., T](definition), definition.__name__)
         )
-        scope_id = f"{run_id}/flow-{next(self._sequence)}:{definition.name}"
+        scope_id = self._next_id(parent, "flow", definition.name)
         completion = Completion[T](quiet_future(asyncio.get_running_loop().create_future()))
         self._completions[scope_id] = completion
         handle = FlowHandle[T](scope_id, completion)
@@ -522,15 +628,236 @@ class EventLoopRuntime(Runtime):
         self._post(_Message("subflow", run_id, payload=(handle, parent, definition, args, kwargs)))
         return handle
 
+    def _next_id(self, parent: str, kind: str, name: str) -> str:
+        key = f"{parent}/{kind}"
+        number = self._sequences.get(key, 0) + 1
+        self._sequences[key] = number
+        return f"{key}-{number}:{quote(name, safe='')}"
+
     def result_details(self, task_id: str) -> TaskResult[Any] | None:
         record = self._records.get(task_id)
         return record.result if record else None
+
+    async def _check_slot(self, run_id: str, node_id: str) -> None:
+        slot = node_id.rsplit(":", 1)[0]
+        path = self.artifacts.run_dir(run_id) / "slots" / f"{fingerprint(slot)}.json"
+        if run_id in self._resumed and path.exists() and read_json(path)["id"] != node_id:
+            raise RecoveryError(
+                f"Submission order changed at {slot}; use resume=False for a new run"
+            )
+        await write_json(path, {"id": node_id})
+
+    def _scope_path(self, run_id: str, scope_id: str) -> Path:
+        return self.artifacts.run_dir(run_id) / "scopes" / f"{fingerprint(scope_id)}.json"
+
+    async def _check_scope(
+        self,
+        run_id: str,
+        scope_id: str,
+        definition: FlowDef[..., Any],
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+    ) -> None:
+        await self._check_slot(run_id, scope_id)
+        controller = definition.controller
+        function = (
+            controller.function if isinstance(controller, CoroutineFlowController) else controller
+        )
+        signature = fingerprint((definition.name, callable_identity(function), args, kwargs))
+        path = self._scope_path(run_id, scope_id)
+        if run_id in self._resumed and path.exists():
+            if read_json(path).get("signature") != signature:
+                raise RecoveryError(
+                    f"Flow replay differs at {scope_id}; use resume=False to start a new run"
+                )
+        await write_json(
+            path,
+            {
+                "scope_id": scope_id,
+                "name": definition.name,
+                "signature": signature,
+                "inputs": (args, kwargs),
+            },
+        )
+
+    async def _restore_record(self, record: _Record) -> None:
+        await self._check_slot(record.handle.run_id, record.handle.id)
+        definition = record.definition
+        backend = definition.backend
+        backend_name = backend if isinstance(backend, str) else None
+        runner = self.runners.get(definition.kind)
+        if isinstance(backend, str) and isinstance(runner, AgentRunner):
+            backend = runner.backends.get(backend)
+        backend_config = (
+            backend
+            if isinstance(backend, str) or backend is None
+            else (
+                callable_identity(backend),
+                {
+                    key: getattr(backend, key)
+                    for key in ("command", "cwd", "model", "sandbox", "extra_args", "executable")
+                    if hasattr(backend, key)
+                },
+            )
+        )
+        record.signature = fingerprint(
+            (
+                definition.name,
+                definition.kind,
+                callable_identity(definition.function),
+                record.inputs,
+                record.control_dependencies,
+                callable_identity(record.policy),
+                backend_config,
+                backend_name,
+                callable_identity(runner),
+                callable_identity(definition.codec),
+                callable_identity(definition.validator),
+                callable_identity(definition.prompt_builder),
+                callable_identity(definition.session),
+                definition.context,
+                callable_identity(self.checkpoint_codec),
+            )
+        )
+        directory = self.artifacts.task_dir(record.handle.run_id, record.handle.id)
+        path = directory / "task.json"
+        if record.handle.run_id not in self._resumed:
+            return
+        if not path.exists():
+            if (directory / "attempts").exists():
+                raise RecoveryError(f"Task checkpoint is missing: {path}")
+            return
+        saved = read_json(path)
+        if saved.get("format") != 1 or saved.get("signature") != record.signature:
+            raise RecoveryError(
+                f"Task replay differs at {record.handle.id}; "
+                "keep submissions and explicit inputs stable, or use resume=False"
+            )
+        history: dict[int, dict[str, Any]] = {a["number"]: a for a in saved["attempts"]}
+        numbers = [
+            int(p.name)
+            for p in (directory / "attempts").glob("[0-9]*")
+            if p.is_dir() and p.name.isdigit()
+        ]
+        record.attempt = max(saved["view"]["attempt"], *numbers, 0)
+        for number in range(1, record.attempt + 1):
+            artifacts = AttemptArtifacts(
+                self.artifacts.attempt_dir(record.handle.run_id, record.handle.id, number)
+            )
+            data: dict[str, Any] | None = history.get(number)
+            if data is None:
+                request_path = artifacts.directory / "request.json"
+                request = read_json(request_path) if request_path.exists() else {}
+                data = {
+                    "number": number,
+                    "started_at": request.get("started_at", saved["started_at"]),
+                    "finished_at": self.clock.now(),
+                    "error": "Execution interrupted before its result was committed",
+                }
+                await write_json(artifacts.result_json, data)
+            launch = read_json(artifacts.launch_json) if artifacts.launch_json.exists() else {}
+            record.attempts.append(
+                Attempt(
+                    number,
+                    data["started_at"],
+                    data["finished_at"],
+                    data.get("error"),
+                    read_text(artifacts.output_txt) if artifacts.output_txt.exists() else None,
+                    read_text(artifacts.stdout_log),
+                    read_text(artifacts.stderr_log),
+                    data.get("session_id"),
+                    data.get("exit_code", launch.get("exit_code")),
+                    artifacts,
+                )
+            )
+        record.metrics.update(saved["view"]["metrics"])
+        if record.attempts:
+            record.previous_error = record.attempts[-1].error
+            record.previous_output = record.attempts[-1].raw_text
+        if saved["view"]["state"] == TaskState.SUCCEEDED:
+            record.cached = saved
+
+    async def _reuse_result(self, record: _Record) -> None:
+        saved = record.cached
+        assert saved is not None
+        values: dict[str, Any] = {}
+        for key in record.data_dependencies:
+            result = self._records[key].result
+            assert result is not None
+            values[key] = result.value
+        resolved = self.inputs.resolve(record.inputs, values)
+        if fingerprint(resolved) != saved["resolved_signature"]:
+            raise RecoveryError(f"Resolved inputs changed for saved task {record.handle.id}")
+        path = self.artifacts.task_dir(record.handle.run_id, record.handle.id) / "value.pickle"
+        try:
+            payload = await asyncio.to_thread(path.read_bytes)
+            if fingerprint(payload) != saved["value_digest"]:
+                raise RecoveryError(f"Saved result is damaged: {path}")
+            value = self.checkpoint_codec.decode(payload)
+        except OSError as exc:
+            raise RecoveryError(f"Saved result is missing: {path}") from exc
+        last = record.attempts[-1]
+        record.result = TaskResult(
+            value,
+            tuple(record.attempts),
+            last.raw_text,
+            last.stdout,
+            last.stderr,
+            last.session_id,
+            artifacts=last.artifacts,
+            exit_code=last.exit_code,
+        )
+        record.resolved_signature = saved["resolved_signature"]
+        record.value_digest = saved["value_digest"]
+        record.cached = None
+        await self._finish(record, TaskState.SUCCEEDED)
+        await self._emit(
+            "task_restored", record.handle.run_id, record.handle.id, name=record.definition.name
+        )
+
+    async def _finish_run_storage(self, run_id: str, error: BaseException | None) -> None:
+        metadata = self._run_metadata[run_id]
+        metadata.update(
+            {
+                "status": "succeeded"
+                if error is None
+                else "interrupted"
+                if isinstance(error, TaskCancelled)
+                else "failed",
+                "error": f"{type(error).__name__}: {error}" if error is not None else None,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "metrics": self._runs[run_id].metrics if run_id in self._runs else {},
+            }
+        )
+        try:
+            await write_json(self.artifacts.run_dir(run_id) / "run.json", metadata)
+        finally:
+            self.artifacts.close_run(run_id)
 
     async def _persist(self, record: _Record | None = None) -> None:
         if not self._aborting:
             snapshot = self.state.snapshot()
             changes = {record.handle.id: record.view()} if record is not None else {}
             await self.state.commit(snapshot.revision, changes)
+            if record is not None and record.cached is None:
+                await write_json(
+                    self.artifacts.task_dir(record.handle.run_id, record.handle.id) / "task.json",
+                    {
+                        "format": 1,
+                        "view": record.view(),
+                        "signature": record.signature,
+                        "inputs": record.inputs,
+                        "control_dependencies": record.control_dependencies,
+                        "attempts": [attempt_metadata(a) for a in record.attempts],
+                        "started_at": record.started_at,
+                        "resolved_signature": record.resolved_signature,
+                        "value_digest": record.value_digest,
+                        "result": result_metadata(record.result)
+                        if record.result is not None
+                        else None,
+                        "error": str(record.error) if record.error is not None else None,
+                    },
+                )
 
     async def _emit(
         self, kind: str, run_id: str | None = None, task_id: str | None = None, **data: Any
@@ -540,6 +867,8 @@ class EventLoopRuntime(Runtime):
         self._event_sequence += 1
         event = RuntimeEvent(self._event_sequence, self.clock.now(), kind, run_id, task_id, data)
         await self.journal.append(event)
+        if run_id is not None:
+            await self.artifacts.append_event(run_id, event)
         self.scheduler.observe(event)
         log_event(event)
 
@@ -648,13 +977,24 @@ class EventLoopRuntime(Runtime):
             completion = Completion[Any](quiet_future(asyncio.get_running_loop().create_future()))
             root = FlowHandle[Any](f"{run_id}/root", completion)
             self._completions[root.id] = completion
-            self._runs[run_id] = _Run(handle, root.id, keep_open)
+            self._runs[run_id] = _Run(
+                handle,
+                root.id,
+                keep_open,
+                metrics=dict(self._run_metadata[run_id].get("metrics", {})),
+            )
+            await self._check_scope(run_id, root.id, definition, args, kwargs)
             self._spawn_scope(run_id, root, None, definition, args, kwargs)
-            await self._emit("run_started", run_id)
+            await self._emit(
+                "run_resumed" if run_id in self._resumed else "run_started",
+                run_id,
+                directory=str(self.artifacts.run_dir(run_id)),
+            )
         elif kind == "submit":
             assert task_id is not None
             record = payload
             self._records[task_id] = record
+            await self._restore_record(record)
             record.submitted_at = self.clock.now()
             run = self._runs[run_id]
             if record.scope_id is None:
@@ -679,11 +1019,16 @@ class EventLoopRuntime(Runtime):
                     RunClosedError("Parent flow is closed")
                 )
             else:
+                await self._check_scope(run_id, handle.id, definition, args, kwargs)
                 self._spawn_scope(run_id, handle, parent, definition, args, kwargs)
         elif kind == "flow_done":
             scope_id, value, error = payload
             scope = self._scopes[scope_id]
             scope.flow_done, scope.value, scope.error = True, value, error
+            await write_json(
+                self._scope_path(run_id, scope_id).with_suffix(".result.json"),
+                {"value": value, "error": str(error) if error is not None else None},
+            )
             if error is not None:
                 await self._cancel_scope_children(scope)
         elif kind == "complete":
@@ -729,6 +1074,10 @@ class EventLoopRuntime(Runtime):
                 raise RunClosedError("Run has completed")
             if task_id is None:
                 run.metrics.update(payload)
+                self._run_metadata[run_id]["metrics"] = run.metrics
+                await write_json(
+                    self.artifacts.run_dir(run_id) / "run.json", self._run_metadata[run_id]
+                )
                 await self._persist()
             else:
                 record = self._records[task_id]
@@ -746,7 +1095,7 @@ class EventLoopRuntime(Runtime):
             if event_kind == "metrics":
                 record.metrics.update(data)
                 await self._persist(record)
-            await self._emit(event_kind, run_id, task_id, **data)
+            await self._emit(event_kind, run_id, task_id, **{**data, "attempt": attempt})
             return event_kind == "metrics"
         else:
             raise RuntimeError(f"Unknown runtime message: {kind}")
@@ -827,6 +1176,9 @@ class EventLoopRuntime(Runtime):
                 raise ConfigurationError("DependencyPolicy must return Gate")
 
     async def _ready(self, record: _Record) -> None:
+        if record.cached is not None:
+            await self._reuse_result(record)
+            return
         record.state = TaskState.READY
         record.ready_at = self.clock.now()
         record.sequence = next(self._ready_sequence)
@@ -909,6 +1261,21 @@ class EventLoopRuntime(Runtime):
             assert details is not None
             values[dependency] = details.value
         args, kwargs = self.inputs.resolve(record.inputs, values)
+        record.resolved_signature = fingerprint((args, kwargs))
+        artifacts = AttemptArtifacts(
+            self.artifacts.attempt_dir(record.handle.run_id, record.handle.id, record.attempt)
+        )
+        await write_json(
+            artifacts.directory / "request.json",
+            {
+                "task_id": record.handle.id,
+                "attempt": record.attempt,
+                "args": args,
+                "kwargs": kwargs,
+                "started_at": record.started_at,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         request = ExecutionRequest(
             record.handle.id,
             record.definition,
@@ -918,6 +1285,7 @@ class EventLoopRuntime(Runtime):
                 record.handle.id, record.attempt, record.previous_error, record.previous_output
             ),
             self.clock,
+            artifacts,
         )
         await self._persist(record)
         await self._emit(
@@ -995,6 +1363,7 @@ class EventLoopRuntime(Runtime):
             return
         record.worker = None
         self._release(record)
+        diagnostic = result if isinstance(result, ExecutionResult) else error
         if record.cancel_requested:
             error = TaskCancelled("Task cancelled")
         elif record.timed_out:
@@ -1004,7 +1373,49 @@ class EventLoopRuntime(Runtime):
         if error is None and not isinstance(result, ExecutionResult):
             error = ConfigurationError("Runner.execute() must return ExecutionResult")
             result = None
-        raw_text = result.raw_text if result is not None else getattr(error, "raw_text", None)
+        artifacts = AttemptArtifacts(
+            self.artifacts.attempt_dir(record.handle.run_id, record.handle.id, attempt)
+        )
+        raw_text: str | None = getattr(diagnostic, "raw_text", None)
+        if raw_text is not None and not artifacts.output_txt.exists():
+            await write_text(artifacts.output_txt, raw_text)
+        if artifacts.output_txt.exists():
+            raw_text = read_text(artifacts.output_txt)
+        for path, name in ((artifacts.stdout_log, "stdout"), (artifacts.stderr_log, "stderr")):
+            if not path.exists():
+                await write_text(path, getattr(diagnostic, name, ""))
+        stdout, stderr = read_text(artifacts.stdout_log), read_text(artifacts.stderr_log)
+        session_id: str | None = getattr(diagnostic, "session_id", None)
+        exit_code: int | None = getattr(diagnostic, "exit_code", None)
+        if exit_code is None and artifacts.launch_json.exists():
+            exit_code = read_json(artifacts.launch_json).get("exit_code")
+        if session_id is None and record.definition.kind == "agent":
+            import json
+
+            for line in stdout.splitlines():
+                try:
+                    event: Any = json.loads(line)
+                    if (
+                        isinstance(event, dict)
+                        and cast(dict[str, Any], event).get("type") == "thread.started"
+                    ):
+                        session_id = cast(dict[str, Any], event).get("thread_id")
+                except ValueError:
+                    continue
+        if error is None:
+            assert result is not None
+            try:
+                payload = self.checkpoint_codec.encode(result.value)
+            except Exception as exc:
+                error = exc
+            else:
+                await asyncio.to_thread(
+                    atomic_write,
+                    self.artifacts.task_dir(record.handle.run_id, record.handle.id)
+                    / "value.pickle",
+                    payload,
+                )
+                record.value_digest = fingerprint(payload)
         record.attempts.append(
             Attempt(
                 attempt,
@@ -1012,7 +1423,22 @@ class EventLoopRuntime(Runtime):
                 self.clock.now(),
                 f"{type(error).__name__}: {error}" if error else None,
                 raw_text,
+                stdout,
+                stderr,
+                session_id,
+                exit_code,
+                artifacts,
             )
+        )
+        await write_json(
+            artifacts.result_json,
+            {
+                **attempt_metadata(record.attempts[-1]),
+                "value": result.value if error is None and result is not None else None,
+                "traceback": "".join(traceback.format_exception(error))
+                if error is not None
+                else None,
+            },
         )
         if record.cancel_requested:
             await self._finish(record, TaskState.CANCELLED, error=error)
@@ -1021,10 +1447,12 @@ class EventLoopRuntime(Runtime):
             record.result = TaskResult(
                 result.value,
                 tuple(record.attempts),
-                result.raw_text,
-                result.stdout,
-                result.stderr,
-                result.session_id,
+                raw_text,
+                stdout,
+                stderr,
+                session_id,
+                artifacts=artifacts,
+                exit_code=exit_code,
             )
             await self._finish(record, TaskState.SUCCEEDED)
         else:
@@ -1061,14 +1489,17 @@ class EventLoopRuntime(Runtime):
     ) -> None:
         record.state, record.error = state, error
         if error is not None:
-            cause = error.cause if isinstance(error, TaskFailed) else error
+            last = record.attempts[-1] if record.attempts else None
             record.result = TaskResult(
                 None,
                 tuple(record.attempts),
-                record.attempts[-1].raw_text if record.attempts else None,
-                getattr(cause, "stdout", ""),
-                getattr(cause, "stderr", ""),
+                last.raw_text if last is not None else None,
+                last.stdout if last is not None else "",
+                last.stderr if last is not None else "",
+                last.session_id if last is not None else None,
                 error=error,
+                artifacts=last.artifacts if last is not None else None,
+                exit_code=last.exit_code if last is not None else None,
             )
         if record.timer is not None:
             record.timer.cancel()
@@ -1163,6 +1594,7 @@ class EventLoopRuntime(Runtime):
             if error is None and self.failures.fail_scope(errors):
                 error = errors[0]
             await self._emit("run_finished", run_id, error=str(error) if error else None)
+            await self._finish_run_storage(run_id, error)
             if error is None:
                 self._completions[run.handle.id].future.set_result(root.value)
             else:
@@ -1207,6 +1639,10 @@ class EventLoopRuntime(Runtime):
                 self._completions[handle.id].future.set_exception(error)
         for handle in self._run_handles.values():
             if not handle.done:
+                try:
+                    await self._finish_run_storage(handle.id, error)
+                except Exception:
+                    self.artifacts.close_run(handle.id)
                 self._completions[handle.id].future.set_exception(error)
         for ack in tuple(self._acks):
             if not ack.done():

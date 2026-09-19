@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 from enum import Enum
@@ -70,6 +71,10 @@ def json_value(value: Any) -> Any:
             json_value(v)
             for v in cast(list[Any] | tuple[Any, ...] | set[Any] | frozenset[Any], value)
         ]
+    if isinstance(value, PathLike):
+        return str(cast(PathLike[str], value))
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
     if value is None or isinstance(value, (str, bool, float, int)):
         return value
     return repr(value)

@@ -79,7 +79,7 @@ def log_event(event: RuntimeEvent) -> None:
             level = logging.INFO
     elif event.kind == "run_finished":
         level = logging.ERROR if event.data.get("error") is not None else logging.INFO
-    elif event.kind in {"run_started", "task_started"}:
+    elif event.kind in {"run_started", "run_resumed", "task_started", "task_restored"}:
         level = logging.INFO
     if not _runtime_logger.isEnabledFor(level):
         return

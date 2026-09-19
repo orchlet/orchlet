@@ -2,7 +2,7 @@
 
 Orchlet is an agent orchestration library that executes Python flows directly. Nodes can be created during a run. A replaceable Scheduler combines declared priority relationships with live weights, and submissions, completions, metric updates, and timers trigger scheduling decisions.
 
-The current runtime uses a single machine and event loop with non-preemptive scheduling. Python functions, closures, and task references remain in memory; executing a flow does not require converting it into JSON first.
+The current runtime uses a single machine and event loop with non-preemptive scheduling. Flows execute as Python functions without conversion into JSON. Run state, successful task results, and agent execution artifacts are saved locally by default, so repeating a command can continue an interrupted or failed run.
 
 **Project language.** Use English for documentation, comments, docstrings, built-in prompts, example data, and user-facing messages throughout the project.
 
@@ -37,11 +37,11 @@ logger = get_logger("workflow")
 logger.info("Starting workflow for %s", "demo")
 ```
 
-Run and task starts and completions appear at INFO, retries and timeouts at WARNING, and failures at ERROR. Use `configure_logging(level="DEBUG")` to include submissions, dependency readiness, metrics, and other detailed events. Runtime messages include run or task IDs and relevant scheduling, attempt, or failure details. Each runtime log record also exposes the original RuntimeEvent as `record.orchlet_event` for custom handlers.
+Run and task starts and completions, resumed runs, and restored task results appear at INFO, retries and timeouts at WARNING, and failures at ERROR. Use `configure_logging(level="DEBUG")` to include submissions, dependency readiness, metrics, and other detailed events. Runtime messages include run or task IDs and relevant scheduling, attempt, or failure details. Each runtime log record also exposes the original RuntimeEvent as `record.orchlet_event` for custom handlers.
 
 Logs go to stderr with timestamps, level colors, and Rich exception rendering. Message markup is disabled, so brackets in prompts, JSON, or model output remain literal. Colors are detected from the terminal. `configure_logging(console=..., show_time=False, show_path=True)` customizes the Rich console and layout. Repeated calls replace the console handler rather than adding duplicate output.
 
-Importing Orchlet does not configure console output. The helper configures only the `orchlet` logger namespace and preserves application handlers and the root logger. Applications can instead configure Python logging directly. All example scripts enable Rich when run as programs. MemoryEventJournal and JsonlJournal continue recording structured events independently of console logging.
+Importing Orchlet does not configure console output. The helper configures only the `orchlet` logger namespace and preserves application handlers and the root logger. Applications can instead configure Python logging directly. All example scripts enable Rich when run as programs. Event journals and the default artifact store record runtime events independently of console logging; enabling Rich is not required for persistence.
 
 **Define dynamic flows in Python.** `ctx.submit()` returns a TaskHandle. Passing a handle as another task's input establishes a dependency. `await handle` retrieves its result for subsequent Python control flow.
 
@@ -253,17 +253,54 @@ Run `pyright` after installing the dev extra. It checks the library, examples, t
 
 The default str result uses TextCodec. Other result_type values use JsonCodec and Pydantic TypeAdapter. Type adaptation follows Pydantic's default conversion rules; use a custom ResultValidator or a strict TypeValidator for stricter checks. Business checks fail by returning False or raising an exception. Other return values mean success and do not replace the result; use ResultValidator for transformations.
 
-A task publishes success only after decoding, type validation, and business checks all pass. Failed agent responses retain their raw text, and retry prompts include the previous response and error. `max_attempts` includes the initial attempt. Backoff does not occupy an execution slot. `timeout` sets the deadline for requesting cancellation; actual completion also depends on Runner confirming shutdown.
+A task publishes success only after execution, any configured decoding and validation, and saving its result checkpoint. Failed agent responses retain their raw text, and retry prompts include the previous response and error. `max_attempts` includes the initial attempt. Backoff does not occupy an execution slot. `timeout` sets the deadline for requesting cancellation; actual completion also depends on Runner confirming shutdown.
 
 `CodexBackend` invokes the local CLI with argv and stdin, uses a read-only sandbox by default, and reads the final response from the output file. It supports `FixedSession(existing_session_id)`; tasks sharing a session execute exclusively within one Runtime. FreshSession creates a new session for each attempt by default. Automatic named shared sessions and steering a running agent are not currently exposed as APIs.
 
 `CommandBackend([...])` sends the prompt through stdin and uses stdout as the final response, without invoking a shell. Tests and custom SDK integrations can subclass AgentBackend, implement `run_turn()`, and return AgentReply.
 
-**Results, failures, and events.** `await handle` returns the business value. `handle.snapshot` exposes task state. `handle.details` exposes TaskResult, including attempts, raw_text, stdout, stderr, session_id, and error. Execution failures raise TaskFailed with the original exception in cause. Skipped, cancelled, and rejected tasks have corresponding error types.
+**Results, failures, and events.** `await handle` returns the business value. `handle.snapshot` exposes task state. `handle.details` exposes TaskResult, including attempts, raw_text, stdout, stderr, session_id, exit_code, artifacts, and error. Each Attempt retains its own diagnostics and artifact paths. Execution failures raise TaskFailed with the original exception in cause. Skipped, cancelled, and rejected tasks have corresponding error types.
 
 After catching a task failure, a flow can submit new repair tasks. A normally returning flow still joins its children. By default, an unhandled failure fails its scope and cancels remaining children. `ctx.all_settled(handles)` returns Outcome objects for explicitly collecting partial results. `CollectFailures` changes scope handling of unobserved errors; directly awaiting a failed handle still raises.
 
-MemoryStateStore and MemoryEventJournal retain snapshots and events during execution. `JsonlJournal(path)` records diagnostic events. Use `runtime.journal.read()` to inspect start order, scheduling reasons, retries, and state changes. Complete business results remain in memory. The journal is not a recovery checkpoint. Transparent recovery of Python flows after process crashes, preemption, and distributed execution are not currently supported.
+MemoryStateStore and MemoryEventJournal retain snapshots and events during execution. `JsonlJournal(path)` is an optional diagnostic journal. Use `runtime.journal.read()` to inspect events from the current runtime instance. The artifact store separately saves checkpoints and a run's `events.jsonl`, which retains event history across restarts. An event journal alone is not a recovery checkpoint. Preemption and distributed execution are not currently supported.
+
+**Durable runs and automatic recovery.** After an interruption or a failed run, repeat the same command from the same working directory with the same flow and explicit inputs. Orchlet automatically opens the matching unfinished run. Successful tasks return their saved values, while failed or interrupted tasks receive new attempts. Restarting permits another attempt even if the earlier run exhausted automatic retries. Attempt numbers continue increasing, preserving previous logs. Repeating a fully successful run starts a new run.
+
+```python
+from orchlet import EventLoopRuntime, FileArtifactStore
+
+# These are the defaults; choose another directory to customize storage.
+runtime = EventLoopRuntime(
+    artifacts=FileArtifactStore(".orchlet/runs"),
+    resume=True,
+)
+result = runtime.run(pipeline, count=7)
+
+# Force a new run while retaining previous run files.
+fresh_runtime = EventLoopRuntime(resume=False)
+```
+
+Automatic matching uses the working directory, command arguments, flow identity, explicit inputs, and the order of repeated invocations within a runtime. Set `run_key="my-workflow"` to provide a lookup key independently of the command; flow and input checks still apply. Recovery validates saved flow and task signatures, submission positions, inputs, and result checkpoints. Detected mismatches or damaged results raise RecoveryError; use `resume=False` when intentionally starting over. A run that handles its task failures and returns successfully is considered complete.
+
+The default store uses `.orchlet/runs/<run_id>/`:
+
+| Files within a run | Contents |
+| --- | --- |
+| `run.json` | Run status, inputs, metrics, timestamps, and errors |
+| `events.jsonl` | Scheduling, execution, retry, and recovery events |
+| `scopes/`, `slots/` | Flow and submission metadata for replay checks |
+| `tasks/<task>/task.json` | Task state, inputs, dependencies, and attempt history |
+| `tasks/<task>/value.pickle` | Successful task value serialized by the checkpoint codec |
+| `tasks/<task>/attempts/001/`, `002/`, ... | Separate files for every execution attempt |
+
+Attempt files include `request.json` and `result.json`, plus agent `prompt.txt`, `stdout.log`, `stderr.log`, `output.txt`, and `launch.json` when available. CodexBackend and CommandBackend write subprocess stdout and stderr directly to files while running. Codex JSON execution events remain in `stdout.log`, and its final response is saved separately in `output.txt`. Custom backends can use `request.artifacts` to persist output during execution; returned AgentReply output is saved by AgentRunner before validation.
+
+Use `run.artifacts_dir` or `ctx.artifacts_dir` for the run directory, `handle.artifacts_dir` for a task directory, and `handle.details.artifacts` for the latest attempt's paths. Keep the store's `.index` directory alongside the run directories for automatic discovery. Run locks prevent concurrent processes from continuing the same invocation; on POSIX, recovery also refuses to race an agent subprocess left running after its parent was killed.
+
+Recovery replays Python flow controllers to reconstruct dynamic submissions. Keep submission order deterministic within each flow, pass changing data as explicit inputs, and put side effects inside tasks. An interruption after an external effect but before the success checkpoint can cause that task to execute again, so tasks must tolerate repeated execution. Files written by tasks, closure state, and arbitrary controller or plugin state are not automatically snapshotted. For `keep_open=True`, callers must resubmit external work when reconstructing the run.
+
+The default PickleCheckpointCodec preserves Python result types. Results must be serializable, and their class definitions must remain available on restart. Provide `checkpoint_codec=...` with a CheckpointCodec implementation for another representation. Pickle can execute code when loaded, so resume only from trusted local run files. The default `.orchlet/` directory is ignored by this repository's Git configuration.
 
 **Extension points and implementation locations.** All abstract interfaces live in `src/orchlet/contracts.py` and use ABC. Implementations are injected through Runtime or Scheduler constructors, without a global plugin singleton.
 
@@ -276,13 +313,14 @@ MemoryStateStore and MemoryEventJournal retain snapshots and events during execu
 | `runners.py`, `backends.py` | Runner, AgentBackend |
 | `prompts.py`, `outputs.py`, `sessions.py` | PromptBuilder, OutputCodec, ResultValidator, SessionPolicy |
 | `state.py`, `events.py`, `clocks.py` | StateStore, EventTransport, EventJournal, Clock |
+| `artifacts.py`, `checkpoints.py` | ArtifactStore, FileArtifactStore, CheckpointCodec, PickleCheckpointCodec |
 | `logging.py` | Rich console setup, named loggers, and runtime event logging |
 
 Task state progresses through submission, dependency waiting, READY, and RUNNING, then success, failure, or RETRY_WAIT. Tasks whose required inputs fail become SKIPPED. Runtime is the only state writer, and attempt numbers prevent stale completion events from overwriting later attempts.
 
 **Repeatable policy experiments.** SimulatedRunner supplies deterministic results and durations from a request. Experiments advance VirtualClock explicitly with `advance()` or `advance_to_next()`. Wait until `clock.next_deadline` is set before advancing to study time-dependent policies without real model calls. VirtualClock does not advance real I/O.
 
-Tests cover dynamic nodes, priority relationships, live weights, shared resources, cancellation cleanup, output repair, session exclusion, external submissions, and abstract component contracts. Codex tests use a fake process and do not make model calls.
+Tests cover dynamic nodes, priority relationships, live weights, shared resources, cancellation cleanup, output repair, session exclusion, external submissions, and abstract component contracts. Recovery tests also cover process termination followed by the same command, saved result types, live subprocess logs, replay mismatches, corrupted checkpoints, and run locks. Codex tests use a fake process and do not make model calls.
 
 ```bash
 python -m pip install -e '.[dev]'

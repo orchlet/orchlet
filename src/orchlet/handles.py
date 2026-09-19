@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Generator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Generic, TypeVar
 
 from ._bridges import Completion, RuntimeBridge
@@ -95,6 +96,10 @@ class TaskHandle(Generic[T_co]):
     def details(self) -> TaskResult[T_co] | None:
         return self._runtime.details(self.id)
 
+    @property
+    def artifacts_dir(self) -> Path:
+        return self._runtime.artifacts.task_dir(self.run_id, self.id)
+
     async def cancel(self) -> None:
         await self._runtime.command("cancel_task", self.run_id, self.id)
 
@@ -131,6 +136,10 @@ class RunHandle(Generic[T_co]):
     @property
     def done(self) -> bool:
         return self._completion.future.done()
+
+    @property
+    def artifacts_dir(self) -> Path:
+        return self._runtime.artifacts.run_dir(self.id)
 
     async def wait(self) -> T_co:
         return await await_shared(self._completion.future)

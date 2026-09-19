@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Concatenate, Protocol
 
 from .models import (
@@ -232,6 +233,39 @@ class EventJournal(ABC):
 
     @abstractmethod
     def read(self) -> Sequence[RuntimeEvent]: ...
+
+
+class ArtifactStore(ABC):
+    """Locate durable execution artifacts and retain the run's event history."""
+
+    @abstractmethod
+    def run_dir(self, run_id: str) -> Path: ...
+
+    @abstractmethod
+    def task_dir(self, run_id: str, task_id: str) -> Path: ...
+
+    @abstractmethod
+    def attempt_dir(self, run_id: str, task_id: str, attempt: int) -> Path: ...
+
+    @abstractmethod
+    async def append_event(self, run_id: str, event: RuntimeEvent) -> None: ...
+
+    @abstractmethod
+    def open_run(self, key: str, *, resume: bool) -> tuple[str, bool]:
+        """Exclusively open an unfinished matching run, or create a new run."""
+
+    @abstractmethod
+    def close_run(self, run_id: str) -> None: ...
+
+
+class CheckpointCodec(ABC):
+    """Serialize successful task values without losing their Python types."""
+
+    @abstractmethod
+    def encode(self, value: Any) -> bytes: ...
+
+    @abstractmethod
+    def decode(self, data: bytes) -> Any: ...
 
 
 class Timer(Protocol):

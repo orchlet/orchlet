@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
-from .contracts import StateStore
+from .contracts import ArtifactStore, StateStore
 from .models import TaskResult
 
 if TYPE_CHECKING:
@@ -66,3 +66,4 @@ class RuntimeBridge:
     details: Callable[[str], TaskResult[Any] | None]
     completion: Callable[[str], Completion[Any]]
     admission: Callable[[str], asyncio.Future[None]]
+    artifacts: ArtifactStore
