@@ -288,6 +288,20 @@ Tests cover dynamic nodes, priority relationships, live weights, shared resource
 python -m pip install -e '.[dev]'
 ruff check .
 ruff format --check .
-pyright
+pyright --warnings
 python -m unittest discover -s tests -v
 ```
+
+**Git commit checks.** Install the [pre-commit](https://pre-commit.com/) hook once per clone, from a Python 3.14+ development environment:
+
+```bash
+python -m pip install -e '.[dev]'
+pre-commit install
+pre-commit run --all-files
+```
+
+Every commit runs `ruff format .`, `ruff check .`, and `pyright --warnings`, in that order. The checks cover the whole project, including commits that only change configuration or documentation. A formatter change stops the commit so you can review and stage the formatted files before committing again. Ruff violations, Pyright errors, and Pyright warnings also stop the commit.
+
+The hooks use isolated Python 3.14 environments with pinned checker versions, so commits from VS Code do not depend on activating a shell environment. Python 3.14 must be available when the hook environments are created. Keep the hook's analysis dependencies aligned with `pyproject.toml` when changing project dependencies. Pre-commit temporarily stashes unstaged tracked changes while checking the staged version.
+
+Local hooks can be bypassed with `git commit --no-verify`. To enforce these checks on the shared branch, run them in CI and require the successful CI status in branch protection.
