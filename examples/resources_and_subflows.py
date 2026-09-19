@@ -3,30 +3,38 @@
 import argparse
 import asyncio
 
-from orchlet import configure_logging, get_logger, EventLoopRuntime, flow, task
+from orchlet import (
+    EventLoopRuntime,
+    FlowContext,
+    TaskHandle,
+    configure_logging,
+    flow,
+    get_logger,
+    task,
+)
 from orchlet.resources import TokenResourceAllocator
 
 logger = get_logger("examples.resources_and_subflows")
 
 
 @task
-async def prepare(label):
+async def prepare(label: str) -> str:
     logger.info(f"Preparing input: {label}")
     await asyncio.sleep(0.005)
     return label.upper()
 
 
 @task
-def collect(values):
+def collect(values: list[str]) -> list[str]:
     return values
 
 
 @flow
-async def pipeline(ctx):
+async def pipeline(ctx: FlowContext) -> list[list[str]]:
     active_gpu, peak_gpu = 0, 0
 
     @task(resources={"gpu": 1})
-    async def infer(label):
+    async def infer(label: str) -> str:
         nonlocal active_gpu, peak_gpu
         active_gpu += 1
         peak_gpu = max(peak_gpu, active_gpu)
@@ -39,8 +47,8 @@ async def pipeline(ctx):
             logger.info(f"GPU finished: {label}")
 
     @flow
-    async def group(group_ctx, name):
-        jobs = []
+    async def group(group_ctx: FlowContext, name: str) -> list[str]:
+        jobs: list[TaskHandle[str]] = []
         for index in range(2):
             prepared = group_ctx.submit(prepare, f"{name}-{index}")
             jobs.append(group_ctx.submit(infer, prepared))
@@ -54,7 +62,7 @@ async def pipeline(ctx):
     return results
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--slots", type=int, default=2)
     args = parser.parse_args()

@@ -2,25 +2,27 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
-from .contracts import Runner
+from .contracts import AgentBackend, Emit, Runner
 from .errors import ConfigurationError, OutputValidationError, TaskCancelled
-from .models import AgentRequest, ExecutionResult
+from .models import AgentRequest, ExecutionRequest, ExecutionResult
 
 
 class CancellationToken:
-    def __init__(self):
+    def __init__(self) -> None:
         self._event = asyncio.Event()
 
-    def request(self):
+    def request(self) -> None:
         self._event.set()
 
     @property
-    def requested(self):
+    def requested(self) -> bool:
         return self._event.is_set()
 
-    async def wait(self):
+    async def wait(self) -> None:
         await self._event.wait()
 
 
@@ -29,14 +31,16 @@ class TaskContext:
     task_id: str
     attempt: int
     cancellation: CancellationToken
-    _emit: object
+    _emit: Emit
 
-    def report(self, **metrics):
+    def report(self, **metrics: Any) -> None:
         self._emit("metrics", metrics)
 
 
-async def _cancellable(work, cancellation, *, can_cancel=True):
-    async def guarded():
+async def _cancellable[T](
+    work: Awaitable[T], cancellation: CancellationToken, *, can_cancel: bool = True
+) -> T:
+    async def guarded() -> T:
         try:
             return await work
         except (SystemExit, KeyboardInterrupt) as exc:
@@ -63,7 +67,9 @@ async def _cancellable(work, cancellation, *, can_cancel=True):
 
 
 class PythonRunner(Runner):
-    async def execute(self, request, emit, cancellation):
+    async def execute(
+        self, request: ExecutionRequest, emit: Emit, cancellation: CancellationToken
+    ) -> ExecutionResult[Any]:
         fn, args = request.definition.function, request.args
         if request.definition.context:
             args = (TaskContext(request.task_id, request.attempt.number, cancellation, emit), *args)
@@ -85,10 +91,12 @@ class PythonRunner(Runner):
 
 
 class AgentRunner(Runner):
-    def __init__(self, backends):
-        self.backends = dict(backends)
+    def __init__(self, backends: Mapping[str, AgentBackend]) -> None:
+        self.backends: dict[str, AgentBackend] = dict(backends)
 
-    async def execute(self, request, emit, cancellation):
+    async def execute(
+        self, request: ExecutionRequest, emit: Emit, cancellation: CancellationToken
+    ) -> ExecutionResult[Any]:
         definition = request.definition
         backend = (
             self.backends.get(definition.backend)
@@ -97,6 +105,14 @@ class AgentRunner(Runner):
         )
         if backend is None:
             raise ConfigurationError(f"Unregistered agent backend: {definition.backend!r}")
+        if (
+            definition.session is None
+            or definition.prompt_builder is None
+            or definition.codec is None
+        ):
+            raise ConfigurationError(
+                "Agent definitions require a session policy, prompt builder, and codec"
+            )
         session_id = definition.session.bind(request.task_id, request.attempt)
         if session_id and not backend.supports_resume:
             raise ConfigurationError("This backend does not support continuing a session")
@@ -125,11 +141,17 @@ class AgentRunner(Runner):
 class SimulatedRunner(Runner):
     """Deterministic duration/result functions can be keyed by request inputs or metadata."""
 
-    def __init__(self, result, duration=1.0):
+    def __init__(
+        self,
+        result: Callable[[ExecutionRequest], Any] | object,
+        duration: float | Callable[[ExecutionRequest], float] = 1.0,
+    ) -> None:
         self.result = result
         self.duration = duration
 
-    async def execute(self, request, emit, cancellation):
+    async def execute(
+        self, request: ExecutionRequest, emit: Emit, cancellation: CancellationToken
+    ) -> ExecutionResult[Any]:
         duration = self.duration(request) if callable(self.duration) else self.duration
         await _cancellable(request.clock.sleep(duration), cancellation)
         value = self.result(request) if callable(self.result) else self.result

@@ -1,16 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Generator
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Final, Generic, TypeVar
 
-T = TypeVar("T")
+from ._bridges import Completion, RuntimeBridge
+from .models import TaskResult, TaskView
+
+if TYPE_CHECKING:
+    from .definitions import TaskDef
+
+# Handles only expose their result type; mutable completion state stays internal.
+T_co = TypeVar("T_co", covariant=True)
 
 
-def quiet_future(future):
+def quiet_future[T](future: asyncio.Future[T]) -> asyncio.Future[T]:
     """Failures remain available to awaiters/scope checks, without un-retrieved warnings."""
 
-    def retrieve(done):
+    def retrieve(done: asyncio.Future[T]) -> None:
         if not done.cancelled():
             done.exception()
 
@@ -18,19 +26,19 @@ def quiet_future(future):
     return future
 
 
-async def await_shared(future):
+async def await_shared[T](future: asyncio.Future[T]) -> T:
     """Detach a cancelled waiter without cancelling or installing logging on shared work."""
     if future.done():
         return future.result()
-    waiter = asyncio.get_running_loop().create_future()
+    waiter: asyncio.Future[T] = asyncio.get_running_loop().create_future()
 
-    def forward(done):
+    def forward(done: asyncio.Future[T]) -> None:
         if waiter.done():
             return
         if done.cancelled():
             waiter.cancel()
-        elif done.exception() is not None:
-            waiter.set_exception(done.exception())
+        elif (error := done.exception()) is not None:
+            waiter.set_exception(error)
         else:
             waiter.set_result(done.result())
 
@@ -42,109 +50,114 @@ async def await_shared(future):
 
 
 @dataclass(frozen=True)
-class OutputRef:
+class OutputRef[T_co]:
     task_id: str
     run_id: str
 
 
-class TaskHandle(Generic[T]):
-    def __init__(self, runtime, task_id, run_id):
+class TaskHandle(Generic[T_co]):
+    def __init__(
+        self,
+        runtime: RuntimeBridge,
+        task_id: str,
+        run_id: str,
+        completion: Completion[T_co],
+    ) -> None:
         self._runtime = runtime
-        self.id, self.run_id = task_id, run_id
-        self._future = quiet_future(asyncio.get_running_loop().create_future())
-        self._admitted = quiet_future(asyncio.get_running_loop().create_future())
-        self._observed = False
+        self.id: str = task_id
+        self.run_id: str = run_id
+        self._completion: Final = completion
 
-    async def result(self) -> T:
+    async def result(self) -> T_co:
         # Cancelling an awaiter does not silently cancel shared node execution.
         try:
-            value = await await_shared(self._future)
+            value = await await_shared(self._completion.future)
         except asyncio.CancelledError:
             raise
         except BaseException:
-            self._observed = True
+            self._completion.observed = True
             raise
-        self._observed = True
+        self._completion.observed = True
         return value
 
-    def __await__(self):
+    def __await__(self) -> Generator[Any, None, T_co]:
         return self.result().__await__()
 
     @property
-    def done(self):
-        return self._future.done()
+    def done(self) -> bool:
+        return self._completion.future.done()
 
     @property
-    def snapshot(self):
+    def snapshot(self) -> TaskView | None:
         return self._runtime.state.snapshot().tasks.get(self.id)
 
     @property
-    def details(self):
-        return self._runtime.result_details(self.id)
+    def details(self) -> TaskResult[T_co] | None:
+        return self._runtime.details(self.id)
 
-    async def cancel(self):
-        await self._runtime._command("cancel_task", self.run_id, self.id)
+    async def cancel(self) -> None:
+        await self._runtime.command("cancel_task", self.run_id, self.id)
 
-    async def update_metrics(self, **metrics):
-        await self._runtime._command("metrics", self.run_id, self.id, metrics)
+    async def update_metrics(self, **metrics: Any) -> None:
+        await self._runtime.command("metrics", self.run_id, self.id, metrics)
 
 
-class FlowHandle:
-    def __init__(self, scope_id):
-        self.id = scope_id
-        self._future = quiet_future(asyncio.get_running_loop().create_future())
-        self._observed = False
+class FlowHandle(Generic[T_co]):
+    def __init__(self, scope_id: str, completion: Completion[T_co]) -> None:
+        self.id: str = scope_id
+        self._completion: Final = completion
 
-    async def result(self):
+    async def result(self) -> T_co:
         try:
-            value = await await_shared(self._future)
+            value = await await_shared(self._completion.future)
         except asyncio.CancelledError:
             raise
         except BaseException:
-            self._observed = True
+            self._completion.observed = True
             raise
-        self._observed = True
+        self._completion.observed = True
         return value
 
-    def __await__(self):
+    def __await__(self) -> Generator[Any, None, T_co]:
         return self.result().__await__()
 
 
-class RunHandle:
-    def __init__(self, runtime, run_id):
-        self._runtime, self.id = runtime, run_id
-        self._future = quiet_future(asyncio.get_running_loop().create_future())
+class RunHandle(Generic[T_co]):
+    def __init__(self, runtime: RuntimeBridge, run_id: str, completion: Completion[T_co]) -> None:
+        self._runtime = runtime
+        self.id: str = run_id
+        self._completion: Final = completion
 
     @property
-    def done(self):
-        return self._future.done()
+    def done(self) -> bool:
+        return self._completion.future.done()
 
-    async def wait(self):
-        return await await_shared(self._future)
+    async def wait(self) -> T_co:
+        return await await_shared(self._completion.future)
 
-    def __await__(self):
+    def __await__(self) -> Generator[Any, None, T_co]:
         return self.wait().__await__()
 
-    def submit(self, definition, *args, **kwargs):
-        return self._runtime._submit(self.id, None, definition, args, kwargs)
+    def submit[T](self, definition: TaskDef[..., T], *args: Any, **kwargs: Any) -> TaskHandle[T]:
+        return self._runtime.submit(self.id, None, definition, args, kwargs)
 
-    async def close_inputs(self):
-        await self._runtime._command("close_inputs", self.id)
+    async def close_inputs(self) -> None:
+        await self._runtime.command("close_inputs", self.id)
 
-    async def cancel(self):
-        await self._runtime._command("cancel_run", self.id)
+    async def cancel(self) -> None:
+        await self._runtime.command("cancel_run", self.id)
 
-    async def update_metrics(self, **metrics):
-        await self._runtime._command("metrics", self.id, payload=metrics)
+    async def update_metrics(self, **metrics: Any) -> None:
+        await self._runtime.command("metrics", self.id, payload=metrics)
 
     @property
-    def tasks(self):
+    def tasks(self) -> tuple[TaskView, ...]:
         return tuple(
             t for t in self._runtime.state.snapshot().tasks.values() if t.run_id == self.id
         )
 
-    def task(self, task_id):
-        handle = self._runtime._handles[task_id]
+    def task(self, task_id: str) -> TaskHandle[Any]:
+        handle = self._runtime.task(task_id)
         if handle.run_id != self.id:
             raise KeyError(task_id)
         return handle

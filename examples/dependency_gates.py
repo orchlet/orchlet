@@ -2,39 +2,47 @@
 
 import asyncio
 
-from orchlet import configure_logging, get_logger, EventLoopRuntime, SubmitOptions, flow, task
+from orchlet import (
+    EventLoopRuntime,
+    FlowContext,
+    SubmitOptions,
+    configure_logging,
+    flow,
+    get_logger,
+    task,
+)
 from orchlet.policies import AllSettled, AnySuccessful
 
 logger = get_logger("examples.dependency_gates")
 
 
 @flow
-async def pipeline(ctx):
+async def pipeline(ctx: FlowContext) -> list[str]:
     allow_remote_to_finish = asyncio.Event()
 
     @task
-    async def cached():
+    async def cached() -> str:
         logger.info("cache: succeeded")
         return "cached result"
 
     @task
-    async def broken():
+    async def broken() -> str:
         logger.warning("broken: failed")
         raise ValueError("This data source is temporarily unavailable")
 
     @task
-    async def remote():
+    async def remote() -> str:
         await allow_remote_to_finish.wait()
         logger.info("remote: succeeded")
         return "remote result"
 
     @task
-    async def continue_early():
+    async def continue_early() -> None:
         logger.info("AnySuccessful: a source succeeded; continue before the remote source finishes")
         allow_remote_to_finish.set()
 
     @task
-    async def cleanup():
+    async def cleanup() -> None:
         logger.info("AllSettled: every source has finished; running cleanup")
 
     sources = (ctx.submit(cached), ctx.submit(broken), ctx.submit(remote))
@@ -55,7 +63,9 @@ async def pipeline(ctx):
             logger.info(f"  {label}: kept result {outcome.value!r}")
         else:
             logger.warning("%s: recorded error %s", label, outcome.error)
-    return [outcome.value for outcome in outcomes if outcome.succeeded]
+    return [
+        outcome.value for outcome in outcomes if outcome.succeeded and outcome.value is not None
+    ]
 
 
 if __name__ == "__main__":

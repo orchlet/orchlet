@@ -6,7 +6,7 @@ The current runtime uses a single machine and event loop with non-preemptive sch
 
 **Project language.** Use English for documentation, comments, docstrings, built-in prompts, example data, and user-facing messages throughout the project.
 
-**Install and run.** Use Python 3.11 or newer from the repository root:
+**Install and run.** Use Python 3.14 or newer from the repository root:
 
 ```bash
 python -m venv .venv
@@ -46,26 +46,26 @@ Importing Orchlet does not configure console output. The helper configures only 
 **Define dynamic flows in Python.** `ctx.submit()` returns a TaskHandle. Passing a handle as another task's input establishes a dependency. `await handle` retrieves its result for subsequent Python control flow.
 
 ```python
-from orchlet import EventLoopRuntime, flow, task
+from orchlet import EventLoopRuntime, FlowContext, flow, task
 
 
 @task(priority=20)
-def generate(count):
+def generate(count: int) -> list[int]:
     return list(range(count))
 
 
 @task(priority=10)
-def double(value):
+def double(value: int) -> int:
     return value * 2
 
 
 @task
-def total(values):
+def total(values: list[int]) -> int:
     return sum(values)
 
 
 @flow
-async def pipeline(ctx, count):
+async def pipeline(ctx: FlowContext, count: int) -> int:
     values = await ctx.submit(generate, count)
     jobs = [ctx.submit(double, value) for value in values]
     return await ctx.submit(total, jobs)
@@ -113,12 +113,13 @@ Calling `await handle.update_metrics(urgency=100)` on a READY task triggers a ne
 
 ```python
 from orchlet import WeightModel
+from orchlet.models import ScheduleSnapshot, TaskView
 
 
 class MyWeight(WeightModel):
-    def evaluate(self, task, snapshot):
+    def evaluate(self, task: TaskView, snapshot: ScheduleSnapshot) -> float:
         waiting = snapshot.now - (task.ready_at if task.ready_at is not None else snapshot.now)
-        return waiting + 2 * task.metrics.get("urgency", 0)
+        return waiting + 2 * float(task.metrics.get("urgency", 0))
 ```
 
 With hard priority relationships, aging alone cannot move a lower-priority task ahead of a higher-priority candidate. Fairness and starvation prevention are policy choices.
@@ -126,15 +127,15 @@ With hard priority relationships, aging alone cannot move a lower-priority task 
 **Replace the entire Scheduler.** Its input is an immutable snapshot, and its output is a batch of start decisions:
 
 ```python
-from orchlet import Scheduler
-from orchlet.models import ScheduleDecision, Start
+from orchlet import ResourceAllocator, Scheduler
+from orchlet.models import ScheduleDecision, ScheduleSnapshot, Start
 
 
 class OneAtATime(Scheduler):
-    def bind_resources(self, allocator):
+    def bind_resources(self, allocator: ResourceAllocator) -> None:
         self.allocator = allocator
 
-    def schedule(self, snapshot):
+    def schedule(self, snapshot: ScheduleSnapshot) -> ScheduleDecision:
         for node in sorted(snapshot.ready, key=lambda item: item.sequence):
             if self.allocator.plan([node], snapshot.resources) is not None:
                 return ScheduleDecision(
@@ -176,7 +177,12 @@ A synchronous submission beyond the admission limit finishes its handle with Adm
 **Submit and control work during a run.**
 
 ```python
-async def control(runtime, pipeline, urgent_task):
+from orchlet import EventLoopRuntime, FlowDef, TaskDef
+
+
+async def control[T, U](
+    runtime: EventLoopRuntime, pipeline: FlowDef[[], T], urgent_task: TaskDef[[], U]
+) -> U:
     async with runtime:
         run = runtime.start(pipeline, keep_open=True)
         urgent = run.submit(urgent_task)
@@ -212,12 +218,38 @@ class Rating:
     validate=lambda value: 0 <= value.score <= 10,
     retry=ExponentialRetry(max_attempts=3, delay=0.5),
 )
-def rate(singer):
+def rate(singer: str) -> str:
     return f"Rate singer {singer}. Return a JSON object with singer and score fields in English."
 
 
 runtime = EventLoopRuntime(backends={"codex": CodexBackend()})
 ```
+
+**Static typing.** The project requires Python 3.14 and configures Pyright/Pylance strict mode in `pyproject.toml`. Open the `orchlet` directory as your editor workspace and select its Python 3.14+ environment. The package includes `py.typed` so downstream projects can use its annotations.
+
+Annotate function inputs, including `ctx: FlowContext` for flows and `ctx: TaskContext` for context-aware tasks. Task return types can be inferred from their bodies or declared explicitly. Decorators preserve the result type through `.options()`, submission, awaiting, mapping, subflows, and runtime calls. An agent's prompt returns `str`; its task result is `str` by default or the type supplied through `result_type`:
+
+```python
+from typing import assert_type
+from orchlet import FlowContext, TaskHandle, flow
+
+
+@flow
+async def ratings(ctx: FlowContext):
+    job = ctx.submit(rate, "Singer A")
+    assert_type(job, TaskHandle[Rating])
+    assert_type(await job, Rating)
+    return await ctx.map(rate, ["Singer A", "Singer B"])
+
+
+assert_type(runtime.run(ratings), list[Rating])
+```
+
+`result_type` supports classes, parameterized containers such as `list[str]`, unions, `Literal`, and `Annotated`. `TypeForm` from `typing_extensions` preserves these types for the checker; the project enables experimental features for Pylance releases that still require this setting for TypeForm. Result types and validator callbacks are linked when `result_type` is supplied. Without it, annotate a task's validation callback explicitly; a decorator factory cannot infer its callback parameter from a function it has not received yet.
+
+`run()`, `arun()`, and `subflow()` also check flow arguments. `submit()`, `asubmit()`, `map()`, and external submissions preserve result types but accept dynamically resolved inputs: Python's typing system cannot express replacing every nested input value with a task handle. `start()` also accepts dynamic arguments because it adds the `keep_open` option. Metadata, backend payloads, and task lookup by a string ID have dynamic types. These boundaries are explicit; strict mode does not imply that all uses of `Any` are forbidden.
+
+Run `pyright` after installing the dev extra. It checks the library, examples, tests, and the `assert_type` regressions in `typecheck/inference.py`. The test suite also checks that invalid result access and incorrect flow arguments produce diagnostics.
 
 The default str result uses TextCodec. Other result_type values use JsonCodec and Pydantic TypeAdapter. Type adaptation follows Pydantic's default conversion rules; use a custom ResultValidator or a strict TypeValidator for stricter checks. Business checks fail by returning False or raising an exception. Other return values mean success and do not replace the result; use ResultValidator for transformations.
 
@@ -256,5 +288,6 @@ Tests cover dynamic nodes, priority relationships, live weights, shared resource
 python -m pip install -e '.[dev]'
 ruff check .
 ruff format --check .
+pyright
 python -m unittest discover -s tests -v
 ```

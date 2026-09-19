@@ -2,7 +2,7 @@
 
 import asyncio
 
-from orchlet import configure_logging, get_logger, EventLoopRuntime, flow, task
+from orchlet import EventLoopRuntime, FlowContext, configure_logging, flow, get_logger, task
 from orchlet.clocks import VirtualClock
 from orchlet.runners import SimulatedRunner
 
@@ -10,19 +10,19 @@ logger = get_logger("examples.virtual_time")
 
 
 @task(kind="simulation")
-def work(value):
+def work(value: str) -> str:
     # SimulatedRunner supplies durations and results without executing this function body.
     raise AssertionError("This example must use SimulatedRunner")
 
 
 @flow
-async def pipeline(ctx):
+async def pipeline(ctx: FlowContext) -> str:
     prepared = ctx.submit(work.options(name="prepare", metadata={"seconds": 120}), "data")
     trained = ctx.submit(work.options(name="train", metadata={"seconds": 600}), prepared)
     return await ctx.submit(work.options(name="evaluate", metadata={"seconds": 30}), trained)
 
 
-async def main():
+async def main() -> None:
     clock = VirtualClock()
     runtime = EventLoopRuntime(
         concurrency=1,
@@ -46,6 +46,7 @@ async def main():
         logger.info(f"Final result: {await run}")
     for event in runtime.journal.read():
         if event.kind in {"task_started", "task_finished"}:
+            assert event.task_id is not None
             name = event.task_id.rsplit(":", 1)[-1]
             logger.info(f"  t={event.time:5g}s  {name:8}  {event.kind}")
     logger.info(f"Total virtual duration: {clock.now():g}s")

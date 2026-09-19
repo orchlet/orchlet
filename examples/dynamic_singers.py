@@ -1,13 +1,24 @@
 """Run locally with a fake backend; pass --codex to make actual Codex calls."""
 
 import argparse
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
 
-from orchlet import configure_logging, get_logger, AgentBackend, EventLoopRuntime, agent, flow, task
+from orchlet import (
+    AgentBackend,
+    EventLoopRuntime,
+    FlowContext,
+    agent,
+    configure_logging,
+    flow,
+    get_logger,
+    task,
+)
 from orchlet.backends import CodexBackend
-from orchlet.models import AgentReply
+from orchlet.contracts import Emit
+from orchlet.models import AgentReply, AgentRequest
 from orchlet.policies import ExponentialRetry
+from orchlet.runners import CancellationToken
 
 logger = get_logger("examples.dynamic_singers")
 
@@ -20,12 +31,12 @@ class Rating:
 
 
 @agent(result_type=list[str], priority=30)
-def generate_singers(count):
+def generate_singers(count: int) -> str:
     return f"List {count} singers. Return only a JSON array of strings, using English names."
 
 
 @agent(result_type=Rating, priority=10, validate=lambda r: 0 <= r.score <= 10)
-def rate_singer(singer):
+def rate_singer(singer: str) -> str:
     return (
         f"Rate singer {singer}. Return a JSON object with singer, score (0 to 10), and reason. "
         "Write the response in English."
@@ -33,19 +44,21 @@ def rate_singer(singer):
 
 
 @task(priority=20)
-def rank(ratings):
+def rank(ratings: list[Rating]) -> list[Rating]:
     return sorted(ratings, key=lambda item: item.score, reverse=True)
 
 
 @flow
-async def singer_flow(ctx, count=5):
+async def singer_flow(ctx: FlowContext, count: int = 5) -> list[Rating]:
     singers = await ctx.submit(generate_singers, count)
     jobs = [ctx.submit(rate_singer, singer) for singer in singers]
     return await ctx.submit(rank, jobs)
 
 
 class DemoBackend(AgentBackend):
-    async def run_turn(self, request, emit, cancellation):
+    async def run_turn(
+        self, request: AgentRequest, emit: Emit, cancellation: CancellationToken
+    ) -> AgentReply:
         if request.prompt.startswith("List "):
             count = int(request.prompt.split()[1])
             return AgentReply(json.dumps([f"Singer {i + 1}" for i in range(count)]))

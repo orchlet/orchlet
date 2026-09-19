@@ -1,14 +1,16 @@
 import asyncio
-from dataclasses import dataclass
 import json
 import os
-from pathlib import Path
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
 
-from orchlet import AgentBackend, EventLoopRuntime, agent, flow
+from orchlet import AgentBackend, EventLoopRuntime, FlowContext, TaskHandle, agent, flow
 from orchlet.backends import CodexBackend, CommandBackend
+from orchlet.contracts import Emit
 from orchlet.errors import (
     BackendError,
     ConfigurationError,
@@ -29,11 +31,13 @@ class Rating:
 
 
 class ScriptedBackend(AgentBackend):
-    def __init__(self, responses):
+    def __init__(self, responses: Iterable[str]) -> None:
         self.responses = iter(responses)
-        self.requests = []
+        self.requests: list[AgentRequest] = []
 
-    async def run_turn(self, request, emit, cancellation):
+    async def run_turn(
+        self, request: AgentRequest, emit: Emit, cancellation: CancellationToken
+    ) -> AgentReply:
         self.requests.append(request)
         return AgentReply(next(self.responses))
 
@@ -43,7 +47,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         backend = ScriptedBackend(
             ["not json", '{"singer":"A", "score":99}', '{"singer":"A", "score":8}']
         )
-        handles = []
+        handles: list[TaskHandle[Rating]] = []
 
         @agent(
             backend="fake",
@@ -55,7 +59,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             return "Rate singer A."
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             handle = ctx.submit(rate)
             handles.append(handle)
             return await handle
@@ -63,22 +67,24 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         runtime = EventLoopRuntime(backends={"fake": backend})
         result = await asyncio.wait_for(runtime.arun(pipeline), 3)
         self.assertEqual(result, Rating("A", 8.0))
-        self.assertEqual(len(handles[0].details.attempts), 3)
+        details = handles[0].details
+        assert details is not None
+        self.assertEqual(len(details.attempts), 3)
         self.assertIn("not json", backend.requests[1].prompt)
         self.assertIn("OutputValidationError", backend.requests[1].prompt)
         self.assertIn('"score":99', backend.requests[2].prompt)
-        self.assertEqual(handles[0].details.raw_text, '{"singer":"A", "score":8}')
+        self.assertEqual(details.raw_text, '{"singer":"A", "score":8}')
 
     async def test_invalid_output_is_not_published_to_downstream(self):
         backend = ScriptedBackend(["[1,2,3]"])
-        handles = []
+        handles: list[TaskHandle[list[str]]] = []
 
         @agent(backend="fake", result_type=list[str])
         def generate():
             return "Names"
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             handle = ctx.submit(generate)
             handles.append(handle)
             return await handle
@@ -87,7 +93,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TaskFailed) as caught:
             await runtime.arun(pipeline)
         self.assertIsInstance(caught.exception.cause, OutputValidationError)
-        self.assertEqual(handles[0].details.raw_text, "[1,2,3]")
+        details = handles[0].details
+        assert details is not None
+        self.assertEqual(details.raw_text, "[1,2,3]")
 
     async def test_same_session_is_serialized(self):
         class SessionBackend(AgentBackend):
@@ -95,9 +103,11 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
             def __init__(self):
                 self.active, self.peak = 0, 0
-                self.sessions = []
+                self.sessions: list[str | None] = []
 
-            async def run_turn(self, request, emit, cancellation):
+            async def run_turn(
+                self, request: AgentRequest, emit: Emit, cancellation: CancellationToken
+            ) -> AgentReply:
                 self.sessions.append(request.session_id)
                 self.active += 1
                 self.peak = max(self.peak, self.active)
@@ -108,11 +118,11 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         backend = SessionBackend()
 
         @agent(backend="fake", session=FixedSession("existing-session"))
-        def prompt(value):
+        def prompt(value: str):
             return value
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             return await ctx.all_settled([ctx.submit(prompt, "a"), ctx.submit(prompt, "b")])
 
         runtime = EventLoopRuntime(concurrency=2, backends={"fake": backend})
@@ -127,7 +137,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             return "hello"
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             return await ctx.submit(prompt)
 
         with self.assertRaises(TaskFailed) as caught:
@@ -144,21 +154,23 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ]
         )
-        handles = []
+        handles: list[TaskHandle[dict[str, int]]] = []
 
         @agent(backend="cmd", result_type=dict[str, int])
         def prompt():
             return '{"answer": 42}'
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             handle = ctx.submit(prompt)
             handles.append(handle)
             return await handle
 
         result = await EventLoopRuntime(backends={"cmd": backend}).arun(pipeline)
         self.assertEqual(result, {"answer": 42})
-        self.assertEqual(handles[0].details.stderr, "diagnostic\n")
+        details = handles[0].details
+        assert details is not None
+        self.assertEqual(details.stderr, "diagnostic\n")
 
     async def test_command_exit_error_retains_diagnostics(self):
         backend = CommandBackend(
@@ -166,7 +178,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(BackendError) as caught:
             await backend.run_turn(
-                AgentRequest("", "task", 1), lambda *_: None, CancellationToken()
+                AgentRequest("", "task", 1), lambda _kind, _data: None, CancellationToken()
             )
         self.assertEqual(caught.exception.exit_code, 2)
         self.assertIn("bad", caught.exception.stderr)
@@ -189,7 +201,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             invocation = asyncio.create_task(
                 backend.run_turn(
                     AgentRequest("", "task", 1),
-                    lambda *_: None,
+                    lambda _kind, _data: None,
                     cancellation,
                 )
             )
@@ -227,7 +239,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             for session in (None, "existing-thread"):
                 reply = await backend.run_turn(
                     AgentRequest("test prompt", "task", 1, session),
-                    lambda *_: None,
+                    lambda _kind, _data: None,
                     CancellationToken(),
                 )
                 args, prompt = json.loads(invocation_path.read_text())

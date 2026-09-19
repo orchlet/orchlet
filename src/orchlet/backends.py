@@ -5,16 +5,28 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from pathlib import Path
 import signal
 import tempfile
+from collections.abc import Mapping, Sequence
+from os import PathLike
+from pathlib import Path
+from typing import Any, cast
 
-from .contracts import AgentBackend
+from .contracts import AgentBackend, Emit
 from .errors import BackendError, TaskCancelled
-from .models import AgentReply
+from .models import AgentReply, AgentRequest
+from .runners import CancellationToken
 
 
-async def _communicate(command, prompt, cancellation, *, cwd=None, env=None, grace=2.0):
+async def _communicate(
+    command: Sequence[str],
+    prompt: str,
+    cancellation: CancellationToken,
+    *,
+    cwd: str | PathLike[str] | None = None,
+    env: Mapping[str, str] | None = None,
+    grace: float = 2.0,
+) -> tuple[int, str, str]:
     process = await asyncio.create_subprocess_exec(
         *command,
         stdin=asyncio.subprocess.PIPE,
@@ -27,7 +39,7 @@ async def _communicate(command, prompt, cancellation, *, cwd=None, env=None, gra
     io = asyncio.create_task(process.communicate(prompt.encode("utf-8")))
     cancelled = asyncio.create_task(cancellation.wait())
 
-    def terminate(hard=False):
+    def terminate(hard: bool = False) -> None:
         if process.returncode is not None and os.name != "posix":
             return
         try:
@@ -40,7 +52,7 @@ async def _communicate(command, prompt, cancellation, *, cwd=None, env=None, gra
         except ProcessLookupError:
             pass
 
-    async def stop():
+    async def stop() -> None:
         terminate()
         try:
             await asyncio.wait_for(asyncio.shield(io), grace)
@@ -55,6 +67,7 @@ async def _communicate(command, prompt, cancellation, *, cwd=None, env=None, gra
             await stop()
             raise TaskCancelled("Agent process stopped")
         stdout, stderr = await io
+        assert process.returncode is not None
         return (
             process.returncode,
             stdout.decode("utf-8", errors="replace"),
@@ -70,14 +83,22 @@ async def _communicate(command, prompt, cancellation, *, cwd=None, env=None, gra
 class CommandBackend(AgentBackend):
     """Send a prompt on stdin, receive the final response on stdout; never invokes a shell."""
 
-    def __init__(self, command, *, cwd=None, env=None):
+    def __init__(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: str | PathLike[str] | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> None:
         if isinstance(command, str) or not command:
             raise ValueError("command must be a nonempty sequence of argv elements")
-        self.command = tuple(command)
+        self.command: tuple[str, ...] = tuple(command)
         self.cwd = cwd
-        self.env = None if env is None else {**os.environ, **env}
+        self.env: dict[str, str] | None = None if env is None else {**os.environ, **env}
 
-    async def run_turn(self, request, emit, cancellation):
+    async def run_turn(
+        self, request: AgentRequest, emit: Emit, cancellation: CancellationToken
+    ) -> AgentReply:
         if request.session_id:
             raise ValueError("CommandBackend does not implement session continuation")
         code, stdout, stderr = await _communicate(
@@ -100,16 +121,25 @@ class CodexBackend(AgentBackend):
     supports_resume = True
 
     def __init__(
-        self, *, executable="codex", model=None, sandbox="read-only", cwd=None, extra_args=()
-    ):
+        self,
+        *,
+        executable: str = "codex",
+        model: str | None = None,
+        sandbox: str = "read-only",
+        cwd: str | PathLike[str] | None = None,
+        extra_args: Sequence[str] = (),
+    ) -> None:
         if sandbox not in {"read-only", "workspace-write", "danger-full-access"}:
             raise ValueError("Unsupported Codex sandbox mode")
         if isinstance(extra_args, str):
             raise TypeError("extra_args must be an argv sequence")
-        self.executable, self.model, self.sandbox = executable, model, sandbox
-        self.cwd, self.extra_args = cwd, tuple(extra_args)
+        self.executable: str = executable
+        self.model: str | None = model
+        self.sandbox: str = sandbox
+        self.cwd: str | PathLike[str] | None = cwd
+        self.extra_args: tuple[str, ...] = tuple(extra_args)
 
-    def command(self, output_path, session_id=None):
+    def command(self, output_path: str | PathLike[str], session_id: str | None = None) -> list[str]:
         command = [
             self.executable,
             "exec",
@@ -129,7 +159,9 @@ class CodexBackend(AgentBackend):
             command += ["resume", session_id]
         return [*command, "-"]
 
-    async def run_turn(self, request, emit, cancellation):
+    async def run_turn(
+        self, request: AgentRequest, emit: Emit, cancellation: CancellationToken
+    ) -> AgentReply:
         with tempfile.TemporaryDirectory(prefix="orchlet-codex-") as directory:
             output = Path(directory) / "response.txt"
             code, stdout, stderr = await _communicate(
@@ -144,8 +176,11 @@ class CodexBackend(AgentBackend):
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(event, dict) and event.get("type") == "thread.started":
-                    session_id = event.get("thread_id", session_id)
+                if (
+                    isinstance(event, dict)
+                    and cast(dict[str, Any], event).get("type") == "thread.started"
+                ):
+                    session_id = cast(dict[str, Any], event).get("thread_id", session_id)
             if code:
                 raise BackendError(
                     f"codex exited with {code}", stdout=stdout, stderr=stderr, exit_code=code

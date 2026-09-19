@@ -5,17 +5,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping, cast
+
+if TYPE_CHECKING:
+    from .contracts import Clock
+    from .definitions import TaskDef
 
 
-def freeze(value):
+def freeze(value: Any) -> Any:
     """Freeze JSON-like metadata recursively; opaque values must already be immutable."""
     if isinstance(value, Mapping):
-        return MappingProxyType({k: freeze(v) for k, v in value.items()})
+        return MappingProxyType({k: freeze(v) for k, v in cast(Mapping[Any, Any], value).items()})
     if isinstance(value, (tuple, list)):
-        return tuple(freeze(v) for v in value)
+        return tuple(freeze(v) for v in cast(tuple[Any, ...] | list[Any], value))
     if isinstance(value, (set, frozenset)):
-        return frozenset(freeze(v) for v in value)
+        return frozenset(freeze(v) for v in cast(set[Any] | frozenset[Any], value))
     return value
 
 
@@ -32,7 +36,7 @@ class TaskState(str, Enum):
     CANCELLED = "cancelled"
 
     @property
-    def terminal(self):
+    def terminal(self) -> bool:
         return self in {self.SUCCEEDED, self.FAILED, self.SKIPPED, self.CANCELLED}
 
 
@@ -57,9 +61,9 @@ class TaskView:
     name: str
     state: TaskState
     priority: Any = 0
-    resources: Mapping[str, float] = field(default_factory=dict)
-    metrics: Mapping[str, Any] = field(default_factory=dict)
-    metadata: Mapping[str, Any] = field(default_factory=dict)
+    resources: Mapping[str, float] = field(default_factory=lambda: dict[str, float]())
+    metrics: Mapping[str, Any] = field(default_factory=lambda: dict[str, Any]())
+    metadata: Mapping[str, Any] = field(default_factory=lambda: dict[str, Any]())
     dependencies: tuple[str, ...] = ()
     submitted_at: float = 0.0
     ready_at: float | None = None
@@ -67,7 +71,7 @@ class TaskView:
     attempt: int = 0
     waiting_dependents: int = 0
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         for name in ("resources", "metrics", "metadata"):
             object.__setattr__(self, name, freeze(getattr(self, name)))
 
@@ -77,7 +81,7 @@ class ResourceSnapshot:
     capacity: Mapping[str, float]
     available: Mapping[str, float]
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         object.__setattr__(self, "capacity", freeze(self.capacity))
         object.__setattr__(self, "available", freeze(self.available))
 
@@ -87,7 +91,7 @@ class AllocationPlan:
     reservations: Mapping[str, Mapping[str, float]]
     remaining: ResourceSnapshot
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         object.__setattr__(self, "reservations", freeze(self.reservations))
 
 
@@ -98,10 +102,10 @@ class ScheduleSnapshot:
     ready: tuple[TaskView, ...]
     running: tuple[TaskView, ...]
     resources: ResourceSnapshot
-    metrics: Mapping[str, Any] = field(default_factory=dict)
+    metrics: Mapping[str, Any] = field(default_factory=lambda: dict[str, Any]())
     trigger: str = "event"
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         object.__setattr__(self, "metrics", freeze(self.metrics))
 
 
@@ -126,9 +130,9 @@ class RuntimeEvent:
     kind: str
     run_id: str | None = None
     task_id: str | None = None
-    data: Mapping[str, Any] = field(default_factory=dict)
+    data: Mapping[str, Any] = field(default_factory=lambda: dict[str, Any]())
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         object.__setattr__(self, "data", freeze(self.data))
 
 
@@ -137,7 +141,7 @@ class StateSnapshot:
     revision: int
     tasks: Mapping[str, TaskView]
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         object.__setattr__(self, "tasks", freeze(self.tasks))
 
 
@@ -157,8 +161,8 @@ class Attempt:
 
 
 @dataclass(frozen=True)
-class TaskResult:
-    value: Any
+class TaskResult[T_co]:
+    value: T_co | None
     attempts: tuple[Attempt, ...]
     raw_text: str | None = None
     stdout: str = ""
@@ -168,8 +172,8 @@ class TaskResult:
 
 
 @dataclass(frozen=True)
-class ExecutionResult:
-    value: Any
+class ExecutionResult[T_co]:
+    value: T_co
     raw_text: str | None = None
     stdout: str = ""
     stderr: str = ""
@@ -177,13 +181,13 @@ class ExecutionResult:
 
 
 @dataclass(frozen=True)
-class Outcome:
+class Outcome[T_co]:
     task_id: str
-    value: Any = None
+    value: T_co | None = None
     error: BaseException | None = None
 
     @property
-    def succeeded(self):
+    def succeeded(self) -> bool:
         return self.error is None
 
 
@@ -214,8 +218,8 @@ class AttemptContext:
 @dataclass(frozen=True)
 class ExecutionRequest:
     task_id: str
-    definition: Any
-    args: tuple
+    definition: TaskDef[..., Any]
+    args: tuple[Any, ...]
     kwargs: Mapping[str, Any]
     attempt: AttemptContext
-    clock: Any
+    clock: Clock

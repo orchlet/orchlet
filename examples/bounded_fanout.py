@@ -3,27 +3,28 @@
 import argparse
 import asyncio
 
-from orchlet import configure_logging, get_logger, EventLoopRuntime, flow, task
+from orchlet import EventLoopRuntime, FlowContext, configure_logging, flow, get_logger, task
 from orchlet.policies import BoundedAdmission
+from orchlet.runners import TaskContext
 
 logger = get_logger("examples.bounded_fanout")
 
 
 @task
-def discover(count):
+def discover(count: int) -> list[int]:
     # Discover items at runtime; the result determines how many tasks are needed.
     return [number for number in range(count) if number % 4 != 0]
 
 
 @flow
-async def pipeline(ctx, count, window):
+async def pipeline(ctx: FlowContext, count: int, window: int) -> list[int]:
     items = await ctx.submit(discover, count)
     logger.info(f"Discovered {len(items)} items: {items}")
     active, peak = 0, 0
-    completed = []
+    completed: list[int] = []
 
     @task(context=True)
-    async def process(task_ctx, number):
+    async def process(task_ctx: TaskContext, number: int) -> int:
         nonlocal active, peak
         active += 1
         peak = max(peak, active)
@@ -44,7 +45,7 @@ async def pipeline(ctx, count, window):
     return values
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--count", type=int, default=12)
     parser.add_argument("--window", type=int, default=4)

@@ -1,10 +1,12 @@
 import asyncio
 import inspect
-from pathlib import Path
 import tempfile
 import unittest
+from collections.abc import Callable
+from pathlib import Path
+from typing import cast
 
-from orchlet import EventLoopRuntime, contracts, flow, task
+from orchlet import EventLoopRuntime, FlowContext, contracts, flow, task
 from orchlet.clocks import VirtualClock
 from orchlet.events import AsyncioEventTransport, JsonlJournal, MemoryEventJournal
 from orchlet.models import RuntimeEvent
@@ -21,7 +23,7 @@ class ExtensionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(journal.read(), (event,))
 
     async def test_transport_preserves_fifo_and_bounded_drain(self):
-        transport = AsyncioEventTransport()
+        transport = AsyncioEventTransport[int]()
         transport.open()
         for number in range(5):
             transport.send(number)
@@ -34,11 +36,11 @@ class ExtensionTests(unittest.IsolatedAsyncioTestCase):
         clock = VirtualClock()
 
         @task(kind="simulation")
-        def work(value):
+        def work(value: int) -> int:
             raise AssertionError("The simulated runner supplies the result")
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             return await ctx.submit(work, 21)
 
         runtime = EventLoopRuntime(
@@ -58,7 +60,8 @@ class ExtensionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(clock.now(), 10)
 
     async def test_virtual_timer_cancellation(self):
-        clock, events = VirtualClock(), []
+        clock = VirtualClock()
+        events: list[str] = []
         cancelled = clock.schedule_at(1, lambda: events.append("cancelled"))
         clock.schedule_at(2, lambda: events.append("fired"))
         cancelled.cancel()
@@ -72,7 +75,7 @@ class ExtensionTests(unittest.IsolatedAsyncioTestCase):
             return 7
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             return await ctx.submit(value)
 
         with tempfile.TemporaryDirectory() as directory:
@@ -96,4 +99,5 @@ class ContractTests(unittest.TestCase):
         self.assertGreaterEqual(len(abstractions), 20)
         for abstraction in abstractions:
             with self.subTest(name=abstraction.__name__), self.assertRaises(TypeError):
-                abstraction()
+                # This test deliberately bypasses construction typing to test ABC enforcement.
+                cast(Callable[[], object], abstraction)()

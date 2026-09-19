@@ -1,9 +1,11 @@
 import asyncio
-from dataclasses import dataclass
 import threading
 import unittest
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
-from orchlet import EventLoopRuntime, Scheduler, SubmitOptions, flow, task
+from orchlet import EventLoopRuntime, FlowContext, Scheduler, SubmitOptions, TaskHandle, flow, task
 from orchlet.clocks import VirtualClock
 from orchlet.errors import (
     AdmissionError,
@@ -13,13 +15,14 @@ from orchlet.errors import (
     TaskCancelled,
     TaskFailed,
 )
-from orchlet.models import ScheduleDecision, Start, TaskState
+from orchlet.models import ScheduleDecision, ScheduleSnapshot, Start, TaskState
 from orchlet.policies import AllSettled, AnySuccessful, BoundedAdmission, ExponentialRetry
+from orchlet.runners import TaskContext
 from orchlet.schedulers import PartialOrderScheduler, WeightedScheduler
 from orchlet.weights import MetricWeight
 
 
-async def until(predicate):
+async def until(predicate: Callable[[], bool]) -> None:
     async with asyncio.timeout(3):
         while not predicate():
             await asyncio.sleep(0.001)
@@ -27,13 +30,13 @@ async def until(predicate):
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.runtimes = []
-        self.loop_errors = []
+        self.runtimes: list[EventLoopRuntime] = []
+        self.loop_errors: list[dict[str, Any]] = []
         asyncio.get_running_loop().set_exception_handler(
             lambda loop, context: self.loop_errors.append(context)
         )
 
-    def runtime(self, **kwargs):
+    def runtime(self, **kwargs: Any) -> EventLoopRuntime:
         runtime = EventLoopRuntime(**kwargs)
         self.runtimes.append(runtime)
         return runtime
@@ -46,19 +49,19 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_dynamic_fanout_including_empty(self):
         @task
-        def generate(count):
+        def generate(count: int):
             return list(range(count))
 
         @task
-        def double(value):
+        def double(value: int):
             return value * 2
 
         @task
-        def collect(values):
+        def collect(values: list[int]):
             return values
 
         @flow
-        async def pipeline(ctx, count):
+        async def pipeline(ctx: FlowContext, count: int):
             values = await ctx.submit(generate, count)
             handles = [ctx.submit(double, v) for v in values]
             return await ctx.submit(collect, handles)
@@ -79,11 +82,11 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             return 7
 
         @task
-        def consume(data):
+        def consume(data: dict[str, list[Payload]]):
             return data["items"][0].value
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             value = ctx.submit(source)
             data = {"items": [Payload(value)]}
             handle = ctx.submit(consume, data)
@@ -93,14 +96,14 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.runtime().arun(pipeline), 7)
 
     async def test_static_priority_and_stable_fifo(self):
-        order = []
+        order: list[str] = []
 
         @task
-        async def work(label):
+        async def work(label: str):
             order.append(label)
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             handles = [
                 ctx.submit(work, "first"),
                 ctx.submit(work, "second"),
@@ -113,7 +116,8 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_weight_changes_waiting_order(self):
         started, release = asyncio.Event(), asyncio.Event()
-        order, handles = [], {}
+        order: list[str] = []
+        handles: dict[str, TaskHandle[None]] = {}
 
         @task(priority=1000)
         async def blocker():
@@ -121,11 +125,11 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             await release.wait()
 
         @task
-        async def work(label):
+        async def work(label: str):
             order.append(label)
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             block = ctx.submit(blocker)
             first = ctx.submit(work.options(priority=10), "a")
             second = ctx.submit(work, "b")
@@ -156,7 +160,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             return "urgent"
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             return await ctx.submit(slow)
 
         run = self.runtime(concurrency=2).start(pipeline, keep_open=True)
@@ -171,7 +175,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_open_run_does_not_finish_when_idle(self):
         @flow
-        async def empty(ctx):
+        async def empty(ctx: FlowContext):
             return 12
 
         runtime = self.runtime()
@@ -187,17 +191,17 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             return 42
 
         @flow
-        async def child(ctx):
+        async def child(ctx: FlowContext):
             return await ctx.submit(value)
 
         @flow
-        async def parent(ctx):
+        async def parent(ctx: FlowContext):
             return await ctx.subflow(child)
 
         self.assertEqual(await asyncio.wait_for(self.runtime(concurrency=1).arun(parent), 2), 42)
 
     async def test_all_submitted_children_are_joined(self):
-        finished = []
+        finished: list[bool] = []
 
         @task
         async def work():
@@ -205,7 +209,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             finished.append(True)
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             ctx.submit(work)
             return "result"
 
@@ -213,7 +217,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(finished, [True])
 
     async def test_retry_wait_releases_slot(self):
-        events = []
+        events: list[str] = []
 
         @task(priority=10, retry=ExponentialRetry(max_attempts=2, delay=0.03))
         async def flaky():
@@ -228,7 +232,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             events.append("other")
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             first, second = ctx.submit(flaky), ctx.submit(other)
             await second
             return await first
@@ -237,36 +241,38 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events, ["attempt1", "other", "attempt2"])
 
     async def test_failure_skips_data_dependents_and_is_inspectable(self):
-        handles = {}
+        handles: dict[str, TaskHandle[None]] = {}
 
         @task
-        def fail():
+        def fail() -> None:
             raise ValueError("bad input")
 
         @task
-        def downstream(value):
+        def downstream(value: int) -> None:
             self.fail("A failed data dependency must not execute")
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             handles["source"] = ctx.submit(fail)
             dependent = ctx.submit(downstream, handles["source"])
             return await ctx.all_settled([dependent])
 
         outcomes = await self.runtime().arun(pipeline)
         self.assertIsInstance(outcomes[0].error, DependencyFailed)
-        self.assertIsInstance(handles["source"].details.error, TaskFailed)
-        self.assertEqual(len(handles["source"].details.attempts), 1)
+        details = handles["source"].details
+        assert details is not None
+        self.assertIsInstance(details.error, TaskFailed)
+        self.assertEqual(len(details.attempts), 1)
 
     async def test_caught_failure_can_create_new_attempt_node(self):
         @task
-        def work(number):
+        def work(number: int):
             if number == 0:
                 raise ValueError("retry at flow level")
             return number
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             try:
                 await ctx.submit(work, 0)
             except TaskFailed:
@@ -290,7 +296,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 stopped.set()
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             ctx.submit(failure)
             ctx.submit(sibling)
 
@@ -300,7 +306,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_control_policy_cannot_bypass_required_data(self):
         release = asyncio.Event()
-        handles = {}
+        handles: dict[str, TaskHandle[int]] = {}
 
         @task
         async def slow():
@@ -312,11 +318,11 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             return 1
 
         @task
-        def consumer(value):
+        def consumer(value: int):
             return value
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             data, control = ctx.submit(slow), ctx.submit(fast)
             handles["consumer"] = ctx.submit(
                 consumer,
@@ -331,13 +337,15 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         run = self.runtime(concurrency=2).start(pipeline)
         await until(lambda: "consumer" in handles and handles["consumer"].snapshot is not None)
         await asyncio.sleep(0.01)
-        self.assertEqual(handles["consumer"].snapshot.state, TaskState.WAITING)
+        snapshot = handles["consumer"].snapshot
+        assert snapshot is not None
+        self.assertEqual(snapshot.state, TaskState.WAITING)
         release.set()
         self.assertEqual(await run, 9)
 
     async def test_all_settled_control_edge_runs_after_failure(self):
         @task
-        async def fail():
+        async def fail() -> None:
             raise ValueError("expected")
 
         @task
@@ -345,7 +353,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             return "clean"
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             source = ctx.submit(fail)
             return await ctx.submit(
                 cleanup,
@@ -358,7 +366,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.runtime().arun(pipeline), "clean")
 
     async def test_timeout_waits_for_async_cleanup(self):
-        cleaned = []
+        cleaned: list[bool] = []
 
         @task(timeout=0.01)
         async def slow():
@@ -368,17 +376,19 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 cleaned.append(True)
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             return await ctx.all_settled([ctx.submit(slow)])
 
         outcomes = await self.runtime(concurrency=1).arun(pipeline)
-        self.assertIsInstance(outcomes[0].error.cause, TimeoutError)
+        error = outcomes[0].error
+        assert isinstance(error, TaskFailed)
+        self.assertIsInstance(error.cause, TimeoutError)
         self.assertEqual(cleaned, [True])
 
     async def test_thread_cancellation_keeps_resource_until_thread_exits(self):
         started, release = threading.Event(), threading.Event()
         ran_second = asyncio.Event()
-        handles = {}
+        handles: dict[str, TaskHandle[None]] = {}
 
         @task(priority=10)
         def thread_work():
@@ -390,7 +400,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             ran_second.set()
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             handles["first"] = ctx.submit(thread_work)
             other = ctx.submit(second)
             return await ctx.all_settled([handles["first"], other])
@@ -401,7 +411,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             await handles["first"].cancel()
             await asyncio.sleep(0.01)
             self.assertFalse(ran_second.is_set())
-            self.assertEqual(handles["first"].snapshot.state, TaskState.CANCELLING)
+            snapshot = handles["first"].snapshot
+            assert snapshot is not None
+            self.assertEqual(snapshot.state, TaskState.CANCELLING)
         finally:
             release.set()
         outcomes = await asyncio.wait_for(run.wait(), 2)
@@ -410,7 +422,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_before_root_flow_starts(self):
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             await asyncio.Event().wait()
 
         run = self.runtime().start(pipeline)
@@ -420,7 +432,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_aclose_includes_a_queued_start_command(self):
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             await asyncio.Event().wait()
 
         runtime = self.runtime()
@@ -438,7 +450,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             return 7
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             handle = ctx.submit(work)
             waiter = asyncio.create_task(handle.result())
             await asyncio.sleep(0)
@@ -451,11 +463,11 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cross_run_data_reference_is_rejected(self):
         @task
-        async def work(value):
+        async def work(value: int):
             return value
 
         @flow
-        async def empty(ctx):
+        async def empty(ctx: FlowContext):
             return None
 
         runtime = self.runtime()
@@ -463,7 +475,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         source = first.submit(work, 1)
 
         @flow
-        async def second(ctx):
+        async def second(ctx: FlowContext):
             return await ctx.submit(work, source)
 
         with self.assertRaisesRegex(ValueError, "this Runtime and run"):
@@ -478,7 +490,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             return ValueError("this is data")
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             return await ctx.all_settled([ctx.submit(work)])
 
         outcomes = await self.runtime().arun(pipeline)
@@ -491,21 +503,23 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             raise SystemExit("stop this node")
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             return await ctx.all_settled([ctx.submit(work)])
 
         outcomes = await self.runtime().arun(pipeline)
-        self.assertIsInstance(outcomes[0].error.cause, RuntimeError)
-        self.assertIn("SystemExit", str(outcomes[0].error.cause))
+        error = outcomes[0].error
+        assert isinstance(error, TaskFailed)
+        self.assertIsInstance(error.cause, RuntimeError)
+        self.assertIn("SystemExit", str(error.cause))
 
     async def test_admission_rejection_and_backpressured_map(self):
         @task
-        async def work(value):
+        async def work(value: int):
             await asyncio.sleep(0.001)
             return value * 2
 
         @flow
-        async def rejected(ctx):
+        async def rejected(ctx: FlowContext):
             return await ctx.all_settled([ctx.submit(work, 1), ctx.submit(work, 2)])
 
         runtime = self.runtime(admission=BoundedAdmission(1))
@@ -514,7 +528,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(outcomes[1].error, AdmissionError)
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             return await ctx.map(work, range(10), max_in_flight=4)
 
         self.assertEqual(await asyncio.wait_for(runtime.arun(pipeline), 3), list(range(0, 20, 2)))
@@ -531,7 +545,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             active -= 1
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             await ctx.submit(work)
 
         runtime = self.runtime(concurrency=1)
@@ -540,7 +554,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_policy_timer_wakes_without_a_completion_event(self):
         class DelayedScheduler(PartialOrderScheduler):
-            def schedule(self, snapshot):
+            def schedule(self, snapshot: ScheduleSnapshot) -> ScheduleDecision:
                 if snapshot.ready and snapshot.now < 5:
                     return ScheduleDecision(snapshot.revision, wake_at=5)
                 return super().schedule(snapshot)
@@ -550,7 +564,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             return 42
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             return await ctx.submit(work)
 
         clock = VirtualClock()
@@ -562,7 +576,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_scheduler_decision_fails_instead_of_hanging(self):
         class DuplicateScheduler(Scheduler):
-            def schedule(self, snapshot):
+            def schedule(self, snapshot: ScheduleSnapshot) -> ScheduleDecision:
                 starts = ()
                 if snapshot.ready:
                     starts = (Start(snapshot.ready[0].id),) * 2
@@ -573,7 +587,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.fail("An invalid decision must not start a worker")
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             return await ctx.submit(work)
 
         runtime = self.runtime(scheduler=DuplicateScheduler())
@@ -583,13 +597,13 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_progress_reports_update_snapshots(self):
         @task(context=True)
-        async def work(ctx):
+        async def work(ctx: TaskContext):
             ctx.report(percent=50)
             await asyncio.sleep(0.01)
             return 1
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             return await ctx.submit(work)
 
         runtime = self.runtime()
@@ -599,7 +613,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_leaf_cannot_submit_children_using_captured_flow_context(self):
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             @task
             async def child():
                 ctx.submit(child)
@@ -607,17 +621,19 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             return await ctx.all_settled([ctx.submit(child)])
 
         outcomes = await self.runtime(concurrency=1).arun(pipeline)
-        self.assertIsInstance(outcomes[0].error.cause, RuntimeError)
+        error = outcomes[0].error
+        assert isinstance(error, TaskFailed)
+        self.assertIsInstance(error.cause, RuntimeError)
 
 
 class SyncRuntimeTests(unittest.TestCase):
     def test_same_runtime_can_run_sequential_event_loops(self):
         @task
-        def double(value):
+        def double(value: int):
             return value * 2
 
         @flow
-        async def pipeline(ctx, value):
+        async def pipeline(ctx: FlowContext, value: int):
             return await ctx.submit(double, value)
 
         runtime = EventLoopRuntime()

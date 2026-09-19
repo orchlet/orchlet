@@ -7,12 +7,31 @@ import contextvars
 import itertools
 import math
 import uuid
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
-from typing import Any
+from types import TracebackType
+from typing import Any, Concatenate, Self, cast
 
+from ._bridges import Completion, RuntimeBridge
 from .clocks import MonotonicClock
-from .contracts import Runtime
-from .definitions import FlowDef, TaskDef, flow as make_flow
+from .contracts import (
+    AdmissionPolicy,
+    AgentBackend,
+    Clock,
+    DependencyPolicy,
+    EventJournal,
+    EventTransport,
+    FailurePolicy,
+    InputResolver,
+    ResourceAllocator,
+    RetryPolicy,
+    Runner,
+    Runtime,
+    Scheduler,
+    StateStore,
+    Timer,
+)
+from .definitions import CoroutineFlowController, FlowDef, TaskDef
 from .errors import (
     AdmissionError,
     ConfigurationError,
@@ -37,6 +56,7 @@ from .models import (
     RuntimeEvent,
     ScheduleDecision,
     ScheduleSnapshot,
+    Start,
     TaskResult,
     TaskState,
     TaskView,
@@ -47,13 +67,15 @@ from .runners import AgentRunner, CancellationToken, PythonRunner
 from .schedulers import PartialOrderScheduler
 from .state import MemoryStateStore
 
-_current_scope = contextvars.ContextVar("orchlet_scope", default=None)
+_current_scope: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "orchlet_scope", default=None
+)
 
 
 @dataclass(frozen=True)
 class SubmitOptions:
-    after: tuple[TaskHandle, ...] = ()
-    dependency_policy: Any = None
+    after: tuple[TaskHandle[Any], ...] = ()
+    dependency_policy: DependencyPolicy | None = None
 
 
 @dataclass
@@ -62,40 +84,40 @@ class _Message:
     run_id: str | None = None
     task_id: str | None = None
     payload: Any = None
-    ack: Any = None
+    ack: asyncio.Future[None] | None = None
 
 
 @dataclass
 class _Record:
-    handle: TaskHandle
-    definition: TaskDef
+    handle: TaskHandle[Any]
+    definition: TaskDef[..., Any]
     scope_id: str | None
     inputs: Any
     data_dependencies: tuple[str, ...]
     control_dependencies: tuple[str, ...]
-    policy: Any
+    policy: DependencyPolicy
     deferred: bool = False
     admitted: bool = False
     state: TaskState = TaskState.SUBMITTED
     submitted_at: float = 0.0
     ready_at: float | None = None
     sequence: int = 0
-    metrics: dict = field(default_factory=dict)
-    attempts: list = field(default_factory=list)
+    metrics: dict[str, Any] = field(default_factory=lambda: dict[str, Any]())
+    attempts: list[Attempt] = field(default_factory=lambda: list[Attempt]())
     attempt: int = 0
     started_at: float = 0.0
     previous_error: str | None = None
     previous_output: str | None = None
-    worker: Any = None
-    token: Any = None
-    timer: Any = None
-    leases: dict = field(default_factory=dict)
+    worker: asyncio.Task[None] | None = None
+    token: CancellationToken = field(default_factory=CancellationToken)
+    timer: Timer | None = None
+    leases: dict[str, float] = field(default_factory=lambda: dict[str, float]())
     cancel_requested: bool = False
     timed_out: bool = False
-    result: TaskResult | None = None
+    result: TaskResult[Any] | None = None
     error: BaseException | None = None
 
-    def view(self):
+    def view(self) -> TaskView:
         resources = dict(self.definition.resources)
         if self.definition.session is not None:
             key = self.definition.session.resource_key()
@@ -125,11 +147,11 @@ class _Record:
 class _Scope:
     id: str
     run_id: str
-    handle: FlowHandle
+    handle: FlowHandle[Any]
     parent: str | None = None
-    tasks: list[str] = field(default_factory=list)
-    children: list[str] = field(default_factory=list)
-    worker: Any = None
+    tasks: list[str] = field(default_factory=lambda: list[str]())
+    children: list[str] = field(default_factory=lambda: list[str]())
+    worker: asyncio.Task[None] | None = None
     flow_done: bool = False
     settled: bool = False
     value: Any = None
@@ -138,29 +160,43 @@ class _Scope:
 
 @dataclass
 class _Run:
-    handle: RunHandle
+    handle: RunHandle[Any]
     root: str
     keep_open: bool
-    external: list[str] = field(default_factory=list)
-    metrics: dict = field(default_factory=dict)
+    external: list[str] = field(default_factory=lambda: list[str]())
+    metrics: dict[str, Any] = field(default_factory=lambda: dict[str, Any]())
     cancelled: bool = False
 
 
 class FlowContext:
-    def __init__(self, runtime, run_id, scope_id):
-        self._runtime, self.run_id, self.scope_id = runtime, run_id, scope_id
+    def __init__(self, runtime: RuntimeBridge, run_id: str, scope_id: str) -> None:
+        self._runtime = runtime
+        self.run_id: str = run_id
+        self.scope_id: str = scope_id
 
-    def _check(self):
+    def _check(self) -> None:
         if _current_scope.get() != self.scope_id:
             raise RuntimeError("Submit children from a flow/subflow, not from a running leaf task")
 
-    def submit(self, definition, *args, options=None, **kwargs):
+    def submit[T](
+        self,
+        definition: TaskDef[..., T],
+        *args: Any,
+        options: SubmitOptions | None = None,
+        **kwargs: Any,
+    ) -> TaskHandle[T]:
         self._check()
-        return self._runtime._submit(self.run_id, self.scope_id, definition, args, kwargs, options)
+        return self._runtime.submit(self.run_id, self.scope_id, definition, args, kwargs, options)
 
-    async def asubmit(self, definition, *args, options=None, **kwargs):
+    async def asubmit[T](
+        self,
+        definition: TaskDef[..., T],
+        *args: Any,
+        options: SubmitOptions | None = None,
+        **kwargs: Any,
+    ) -> TaskHandle[T]:
         self._check()
-        handle = self._runtime._submit(
+        handle = self._runtime.submit(
             self.run_id,
             self.scope_id,
             definition,
@@ -169,19 +205,24 @@ class FlowContext:
             options,
             deferred=True,
         )
-        await await_shared(handle._admitted)
+        await await_shared(self._runtime.admission(handle.id))
         return handle
 
-    def subflow(self, definition, *args, **kwargs):
+    def subflow[**P, T](
+        self,
+        definition: FlowDef[P, T] | Callable[Concatenate[FlowContext, P], Awaitable[T]],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> FlowHandle[T]:
         self._check()
-        return self._runtime._subflow(self.run_id, self.scope_id, definition, args, kwargs)
+        return self._runtime.subflow(self.run_id, self.scope_id, definition, args, kwargs)
 
-    async def all_settled(self, handles):
+    async def all_settled[T](self, handles: Iterable[TaskHandle[T]]) -> list[Outcome[T]]:
         handles = tuple(handles)
         for handle in handles:
-            handle._observed = True
+            self._runtime.completion(handle.id).observed = True
 
-        async def settle(handle):
+        async def settle(handle: TaskHandle[T]) -> Outcome[T]:
             try:
                 return Outcome(handle.id, value=await handle.result())
             except Exception as exc:
@@ -189,16 +230,19 @@ class FlowContext:
 
         return list(await asyncio.gather(*(settle(handle) for handle in handles)))
 
-    async def map(self, definition, iterable, *, max_in_flight=32):
+    async def map[T](
+        self, definition: TaskDef[..., T], iterable: Iterable[Any], *, max_in_flight: int = 32
+    ) -> list[T]:
         """Bound submitted-but-uncollected work, preserving input order in the result."""
         if (
             isinstance(max_in_flight, bool)
-            or not isinstance(max_in_flight, int)
+            or not isinstance(cast(object, max_in_flight), int)
             or max_in_flight < 1
         ):
             raise ValueError("max_in_flight must be a positive integer")
         iterator = iter(iterable)
-        pending, results = {}, []
+        pending: dict[asyncio.Future[T], int] = {}
+        results: list[T | None] = []
         exhausted = False
         while pending or not exhausted:
             while len(pending) < max_in_flight and not exhausted:
@@ -208,82 +252,102 @@ class FlowContext:
                     exhausted = True
                     break
                 handle = await self.asubmit(definition, item)
-                handle._observed = True
-                pending[handle._future] = len(results)
+                self._runtime.completion(handle.id).observed = True
+                pending[self._runtime.completion(handle.id).future] = len(results)
                 results.append(None)
             if pending:
                 done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 for future in done:
                     results[pending.pop(future)] = future.result()
-        return results
+        # Every placeholder has been replaced after all submitted futures finish.
+        return cast(list[T], results)
 
-    async def update_metrics(self, **metrics):
-        await self._runtime._command("metrics", self.run_id, payload=metrics)
+    async def update_metrics(self, **metrics: Any) -> None:
+        await self._runtime.command("metrics", self.run_id, payload=metrics)
 
 
 class EventLoopRuntime(Runtime):
     def __init__(
         self,
         *,
-        concurrency=None,
-        scheduler=None,
-        resources=None,
-        inputs=None,
-        dependencies=None,
-        admission=None,
-        retries=None,
-        failures=None,
-        runners=None,
-        backends=None,
-        state=None,
-        journal=None,
-        transport=None,
-        clock=None,
-    ):
+        concurrency: int | None = None,
+        scheduler: Scheduler | None = None,
+        resources: ResourceAllocator | None = None,
+        inputs: InputResolver | None = None,
+        dependencies: DependencyPolicy | None = None,
+        admission: AdmissionPolicy | None = None,
+        retries: RetryPolicy | None = None,
+        failures: FailurePolicy | None = None,
+        runners: Mapping[str, Runner] | None = None,
+        backends: Mapping[str, AgentBackend] | None = None,
+        state: StateStore | None = None,
+        journal: EventJournal | None = None,
+        transport: EventTransport[_Message] | None = None,
+        clock: Clock | None = None,
+    ) -> None:
         if concurrency is not None and resources is not None:
             raise ConfigurationError("Pass concurrency or resources, not both")
-        self.scheduler = scheduler if scheduler is not None else PartialOrderScheduler()
-        self.resources = (
+        self.scheduler: Scheduler = scheduler if scheduler is not None else PartialOrderScheduler()
+        self.resources: ResourceAllocator = (
             resources
             if resources is not None
             else TokenResourceAllocator(
                 global_slots=4 if concurrency is None else concurrency,
             )
         )
-        self.inputs = inputs if inputs is not None else NestedInputResolver()
-        self.dependencies = dependencies if dependencies is not None else AllSuccessful()
-        self.admission = admission if admission is not None else BoundedAdmission()
-        self.retries = retries if retries is not None else NoRetry()
-        self.failures = failures if failures is not None else FailScope()
-        self.state = state if state is not None else MemoryStateStore()
-        self.journal = journal if journal is not None else MemoryEventJournal()
-        self.transport = transport if transport is not None else AsyncioEventTransport()
-        self.clock = clock if clock is not None else MonotonicClock()
-        self.runners = {"python": PythonRunner(), "agent": AgentRunner(backends or {})}
+        self.inputs: InputResolver = inputs if inputs is not None else NestedInputResolver()
+        self.dependencies: DependencyPolicy = (
+            dependencies if dependencies is not None else AllSuccessful()
+        )
+        self.admission: AdmissionPolicy = admission if admission is not None else BoundedAdmission()
+        self.retries: RetryPolicy = retries if retries is not None else NoRetry()
+        self.failures: FailurePolicy = failures if failures is not None else FailScope()
+        self.state: StateStore = state if state is not None else MemoryStateStore()
+        self.journal: EventJournal = journal if journal is not None else MemoryEventJournal()
+        self.transport: EventTransport[_Message] = (
+            transport if transport is not None else AsyncioEventTransport()
+        )
+        self.clock: Clock = clock if clock is not None else MonotonicClock()
+        self.runners: dict[str, Runner] = {
+            "python": PythonRunner(),
+            "agent": AgentRunner(backends or {}),
+        }
         if runners is not None:
             self.runners.update(runners)
         self.scheduler.bind_resources(self.resources)
         self._resource_state = self.resources.initial()
-        self._engine = None
-        self._loop = None
-        self._records = {}
-        self._handles = {}
-        self._runs = {}
-        self._run_handles = {}
-        self._scope_handles = {}
-        self._scopes = {}
-        self._dependents = {}
-        self._dirty = {}
-        self._pending = {}
-        self._acks = set()
+        self._engine: asyncio.Task[None] | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._records: dict[str, _Record] = {}
+        self._handles: dict[str, TaskHandle[Any]] = {}
+        self._completions: dict[str, Completion[Any]] = {}
+        self._admissions: dict[str, asyncio.Future[None]] = {}
+        self._bridge = RuntimeBridge(
+            self.state,
+            self._command,
+            self._submit,
+            self._subflow,
+            self._handles.__getitem__,
+            self.result_details,
+            self._completions.__getitem__,
+            self._admissions.__getitem__,
+        )
+        self._runs: dict[str, _Run] = {}
+        self._run_handles: dict[str, RunHandle[Any]] = {}
+        self._scope_handles: dict[str, FlowHandle[Any]] = {}
+        self._scopes: dict[str, _Scope] = {}
+        self._dependents: dict[str, dict[str, None]] = {}
+        self._dirty: dict[str, None] = {}
+        self._pending: dict[str, int] = {}
+        self._acks: set[asyncio.Future[None]] = set()
         self._sequence = itertools.count(1)
         self._ready_sequence = itertools.count(1)
         self._event_sequence = max((e.sequence for e in self.journal.read()), default=0)
-        self._policy_timer = None
+        self._policy_timer: Timer | None = None
         self._policy_generation = 0
         self._aborting = False
 
-    def _ensure_engine(self):
+    def _ensure_engine(self) -> None:
         loop = asyncio.get_running_loop()
         if self._engine is not None and not self._engine.done():
             if self._loop is not loop:
@@ -294,41 +358,61 @@ class EventLoopRuntime(Runtime):
         self.transport.open()
         self._engine = loop.create_task(self._drive(), name="orchlet-runtime")
 
-    def _post(self, message):
+    def _post(self, message: _Message) -> None:
         if message.run_id is not None:
             self._pending[message.run_id] = self._pending.get(message.run_id, 0) + 1
         self.transport.send(message)
 
-    def _timer_message(self, message):
+    def _timer_message(self, message: _Message) -> None:
         if self._engine is None or self._engine.done():
             return
         if message.run_id is not None and self._runs[message.run_id].handle.done:
             return
         self._post(message)
 
-    async def _command(self, kind, run_id=None, task_id=None, payload=None):
+    async def _command(
+        self, kind: str, run_id: str | None = None, task_id: str | None = None, payload: Any = None
+    ) -> None:
         if self._engine is None or self._engine.done():
             raise RunClosedError("Runtime has no active runs")
         if self._loop is not asyncio.get_running_loop():
             raise RuntimeError("Control commands must use the Runtime's event loop")
-        ack = quiet_future(self._loop.create_future())
+        assert self._loop is not None
+        ack: asyncio.Future[None] = quiet_future(self._loop.create_future())
         self._acks.add(ack)
         ack.add_done_callback(self._acks.discard)
         self._post(_Message(kind, run_id, task_id, payload, ack))
         return await await_shared(ack)
 
-    def start(self, flow, *args, keep_open=False, **kwargs):
-        definition = flow if isinstance(flow, FlowDef) else make_flow(flow)
+    def start[T](
+        self,
+        flow: FlowDef[..., T] | Callable[..., Awaitable[T]],
+        *args: Any,
+        keep_open: bool = False,
+        **kwargs: Any,
+    ) -> RunHandle[T]:
+        definition: FlowDef[..., T] = (
+            cast(FlowDef[..., T], flow)
+            if isinstance(flow, FlowDef)
+            else FlowDef[..., T](CoroutineFlowController[..., T](flow), flow.__name__)
+        )
         self._ensure_engine()
         run_id = uuid.uuid4().hex[:12]
-        handle = RunHandle(self, run_id)
+        completion = Completion[T](quiet_future(asyncio.get_running_loop().create_future()))
+        self._completions[run_id] = completion
+        handle = RunHandle[T](self._bridge, run_id, completion)
         self._run_handles[run_id] = handle
         self._post(
             _Message("start_run", run_id, payload=(handle, definition, args, kwargs, keep_open))
         )
         return handle
 
-    async def arun(self, flow, *args, **kwargs):
+    async def arun[**P, T](
+        self,
+        flow: FlowDef[P, T] | Callable[Concatenate[FlowContext, P], Awaitable[T]],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> T:
         run = self.start(flow, *args, **kwargs)
         try:
             return await run.wait()
@@ -338,7 +422,7 @@ class EventLoopRuntime(Runtime):
                 await asyncio.gather(run.wait(), return_exceptions=True)
             raise
 
-    async def aclose(self):
+    async def aclose(self) -> None:
         # Include runs whose start command has not been consumed yet.
         for handle in tuple(self._run_handles.values()):
             if not handle.done:
@@ -349,14 +433,28 @@ class EventLoopRuntime(Runtime):
         if self._engine is not None:
             await asyncio.shield(self._engine)
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> Self:
         return self
 
-    async def __aexit__(self, *exc):
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         await self.aclose()
 
-    def _submit(self, run_id, scope_id, definition, args, kwargs, options=None, deferred=False):
-        if not isinstance(definition, TaskDef):
+    def _submit[T](
+        self,
+        run_id: str,
+        scope_id: str | None,
+        definition: TaskDef[..., T],
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+        options: SubmitOptions | None = None,
+        deferred: bool = False,
+    ) -> TaskHandle[T]:
+        if not isinstance(cast(object, definition), TaskDef):
             raise TypeError("Submit a @task/@agent definition; use ctx.subflow for flows")
         if self._engine is None or self._engine.done():
             raise RunClosedError("Runtime has no active run")
@@ -371,16 +469,20 @@ class EventLoopRuntime(Runtime):
         controls = tuple(options.after)
         for ref in (*references, *controls):
             if isinstance(ref, TaskHandle):
-                if ref._runtime is not self or ref.run_id != run_id:
+                if self._handles.get(ref.id) is not ref or ref.run_id != run_id:
                     raise ValueError("Dependencies must belong to this Runtime and run")
-                ref._observed = True
-            elif isinstance(ref, OutputRef):
+                self._completions[ref.id].observed = True
+            elif isinstance(cast(object, ref), OutputRef):
                 if ref.run_id != run_id or ref.task_id not in self._handles:
                     raise ValueError("Unknown or cross-run input reference")
             else:
                 raise TypeError("Control dependencies must be TaskHandles")
         task_id = f"{run_id}/{next(self._sequence)}:{definition.name}"
-        handle = TaskHandle(self, task_id, run_id)
+        completion = Completion[T](quiet_future(asyncio.get_running_loop().create_future()))
+        admitted: asyncio.Future[None] = quiet_future(asyncio.get_running_loop().create_future())
+        self._completions[task_id] = completion
+        self._admissions[task_id] = admitted
+        handle = TaskHandle[T](self._bridge, task_id, run_id, completion)
         self._handles[task_id] = handle
         record = _Record(
             handle,
@@ -399,25 +501,40 @@ class EventLoopRuntime(Runtime):
         self._post(_Message("submit", run_id, task_id, record))
         return handle
 
-    def _subflow(self, run_id, parent, definition, args, kwargs):
-        definition = definition if isinstance(definition, FlowDef) else make_flow(definition)
+    def _subflow[T](
+        self,
+        run_id: str,
+        parent: str,
+        definition: FlowDef[..., T] | Callable[..., Awaitable[T]],
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+    ) -> FlowHandle[T]:
+        definition = (
+            cast(FlowDef[..., T], definition)
+            if isinstance(definition, FlowDef)
+            else FlowDef[..., T](CoroutineFlowController[..., T](definition), definition.__name__)
+        )
         scope_id = f"{run_id}/flow-{next(self._sequence)}:{definition.name}"
-        handle = FlowHandle(scope_id)
+        completion = Completion[T](quiet_future(asyncio.get_running_loop().create_future()))
+        self._completions[scope_id] = completion
+        handle = FlowHandle[T](scope_id, completion)
         self._scope_handles[scope_id] = handle
         self._post(_Message("subflow", run_id, payload=(handle, parent, definition, args, kwargs)))
         return handle
 
-    def result_details(self, task_id):
+    def result_details(self, task_id: str) -> TaskResult[Any] | None:
         record = self._records.get(task_id)
         return record.result if record else None
 
-    async def _persist(self, record=None):
+    async def _persist(self, record: _Record | None = None) -> None:
         if not self._aborting:
             snapshot = self.state.snapshot()
             changes = {record.handle.id: record.view()} if record is not None else {}
             await self.state.commit(snapshot.revision, changes)
 
-    async def _emit(self, kind, run_id=None, task_id=None, **data):
+    async def _emit(
+        self, kind: str, run_id: str | None = None, task_id: str | None = None, **data: Any
+    ) -> None:
         if self._aborting:
             return
         self._event_sequence += 1
@@ -426,18 +543,26 @@ class EventLoopRuntime(Runtime):
         self.scheduler.observe(event)
         log_event(event)
 
-    def _spawn_scope(self, run_id, handle, parent, definition, args, kwargs):
+    def _spawn_scope(
+        self,
+        run_id: str,
+        handle: FlowHandle[Any],
+        parent: str | None,
+        definition: FlowDef[..., Any],
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+    ) -> _Scope:
         scope = _Scope(handle.id, run_id, handle, parent)
         self._scope_handles[scope.id] = handle
         self._scopes[scope.id] = scope
         if parent:
             self._scopes[parent].children.append(scope.id)
 
-        async def drive_flow():
+        async def drive_flow() -> None:
             token = _current_scope.set(scope.id)
             value, error = None, None
             try:
-                context = FlowContext(self, run_id, scope.id)
+                context = FlowContext(self._bridge, run_id, scope.id)
                 value = await definition.controller.run(context, args, kwargs)
             except BaseException as exc:
                 error = (
@@ -449,9 +574,10 @@ class EventLoopRuntime(Runtime):
                 _current_scope.reset(token)
             self._post(_Message("flow_done", run_id, payload=(scope.id, value, error)))
 
+        assert self._loop is not None
         scope.worker = self._loop.create_task(drive_flow(), name=f"orchlet:{definition.name}")
 
-        def cancelled_before_start(worker):
+        def cancelled_before_start(worker: asyncio.Task[None]) -> None:
             if worker.cancelled():
                 self._post(
                     _Message(
@@ -468,7 +594,7 @@ class EventLoopRuntime(Runtime):
         scope.worker.add_done_callback(cancelled_before_start)
         return scope
 
-    async def _drive(self):
+    async def _drive(self) -> None:
         try:
             while True:
                 first = await self.transport.receive()
@@ -507,20 +633,26 @@ class EventLoopRuntime(Runtime):
                 self._policy_timer.cancel()
                 self._policy_timer = None
 
-    async def _apply(self, message):
+    async def _apply(self, message: _Message) -> bool:
         kind, run_id, task_id, payload = (
             message.kind,
             message.run_id,
             message.task_id,
             message.payload,
         )
+        if kind == "policy_wake":
+            return payload == self._policy_generation
+        assert run_id is not None
         if kind == "start_run":
             handle, definition, args, kwargs, keep_open = payload
-            root = FlowHandle(f"{run_id}/root")
+            completion = Completion[Any](quiet_future(asyncio.get_running_loop().create_future()))
+            root = FlowHandle[Any](f"{run_id}/root", completion)
+            self._completions[root.id] = completion
             self._runs[run_id] = _Run(handle, root.id, keep_open)
             self._spawn_scope(run_id, root, None, definition, args, kwargs)
             await self._emit("run_started", run_id)
         elif kind == "submit":
+            assert task_id is not None
             record = payload
             self._records[task_id] = record
             record.submitted_at = self.clock.now()
@@ -543,7 +675,9 @@ class EventLoopRuntime(Runtime):
             handle, parent, definition, args, kwargs = payload
             scope = self._scopes[parent]
             if scope.flow_done or self._runs[run_id].cancelled:
-                handle._future.set_exception(RunClosedError("Parent flow is closed"))
+                self._completions[handle.id].future.set_exception(
+                    RunClosedError("Parent flow is closed")
+                )
             else:
                 self._spawn_scope(run_id, handle, parent, definition, args, kwargs)
         elif kind == "flow_done":
@@ -553,13 +687,16 @@ class EventLoopRuntime(Runtime):
             if error is not None:
                 await self._cancel_scope_children(scope)
         elif kind == "complete":
+            assert task_id is not None
             await self._complete(self._records[task_id], *payload)
         elif kind == "retry":
+            assert task_id is not None
             record = self._records[task_id]
             if record.state == TaskState.RETRY_WAIT and record.attempt == payload:
                 record.timer = None
                 await self._ready(record)
         elif kind == "timeout":
+            assert task_id is not None
             record = self._records[task_id]
             if record.state == TaskState.RUNNING and record.attempt == payload:
                 record.timed_out = True
@@ -568,6 +705,7 @@ class EventLoopRuntime(Runtime):
                 await self._persist(record)
                 await self._emit("task_timeout", run_id, task_id, attempt=record.attempt)
         elif kind == "cancel_task":
+            assert task_id is not None
             record = self._records[task_id]
             if record.handle.run_id != run_id:
                 raise ValueError("Task belongs to another run")
@@ -578,6 +716,7 @@ class EventLoopRuntime(Runtime):
                 run.cancelled, run.keep_open = True, False
                 root = self._scopes[run.root]
                 if not root.flow_done:
+                    assert root.worker is not None
                     root.worker.cancel()
                 await self._cancel_scope_children(root)
                 for node_id in run.external:
@@ -599,6 +738,7 @@ class EventLoopRuntime(Runtime):
                 await self._persist(record)
             await self._emit("metrics_updated", run_id, task_id, metrics=payload)
         elif kind == "runner_event":
+            assert task_id is not None
             attempt, event_kind, data = payload
             record = self._records[task_id]
             if record.attempt != attempt or record.state.terminal:
@@ -608,13 +748,11 @@ class EventLoopRuntime(Runtime):
                 await self._persist(record)
             await self._emit(event_kind, run_id, task_id, **data)
             return event_kind == "metrics"
-        elif kind == "policy_wake":
-            return payload == self._policy_generation
         else:
             raise RuntimeError(f"Unknown runtime message: {kind}")
         return True
 
-    async def _admit(self, record):
+    async def _admit(self, record: _Record) -> None:
         if record.definition.kind not in self.runners:
             await self._finish(
                 record,
@@ -652,16 +790,16 @@ class EventLoopRuntime(Runtime):
         for dependency in (*record.data_dependencies, *record.control_dependencies):
             self._dependents.setdefault(dependency, {}).setdefault(record.handle.id, None)
         self._dirty.setdefault(record.handle.id, None)
-        record.handle._admitted.set_result(None)
+        self._admissions[record.handle.id].set_result(None)
         await self._persist(record)
         await self._emit("task_submitted", record.handle.run_id, record.handle.id)
 
-    async def _admit_deferred(self):
+    async def _admit_deferred(self) -> None:
         for record in tuple(self._records.values()):
             if record.state == TaskState.SUBMITTED and record.deferred:
                 await self._admit(record)
 
-    async def _refresh_dependencies(self):
+    async def _refresh_dependencies(self) -> None:
         while self._dirty:
             node_id = next(iter(self._dirty))
             del self._dirty[node_id]
@@ -688,14 +826,14 @@ class EventLoopRuntime(Runtime):
             elif gate != Gate.WAIT:
                 raise ConfigurationError("DependencyPolicy must return Gate")
 
-    async def _ready(self, record):
+    async def _ready(self, record: _Record) -> None:
         record.state = TaskState.READY
         record.ready_at = self.clock.now()
         record.sequence = next(self._ready_sequence)
         await self._persist(record)
         await self._emit("task_ready", record.handle.run_id, record.handle.id)
 
-    async def _schedule(self, trigger):
+    async def _schedule(self, trigger: str) -> None:
         views = tuple(
             replace(
                 record.view(),
@@ -717,7 +855,10 @@ class EventLoopRuntime(Runtime):
             trigger,
         )
         decision = self.scheduler.schedule(snapshot)
-        if not isinstance(decision, ScheduleDecision) or decision.revision != snapshot.revision:
+        if (
+            not isinstance(cast(object, decision), ScheduleDecision)
+            or decision.revision != snapshot.revision
+        ):
             raise SchedulingError("Scheduler returned an invalid or stale decision")
         ids = [start.task_id for start in decision.starts]
         if len(set(ids)) != len(ids):
@@ -756,13 +897,17 @@ class EventLoopRuntime(Runtime):
         if snapshot.ready and not ids and decision.wake_at is None and not snapshot.running:
             await self._emit("scheduler_waiting", reason="Policy selected no tasks and no wakeup")
 
-    async def _launch(self, record, start):
+    async def _launch(self, record: _Record, start: Start) -> None:
         record.state = TaskState.RUNNING
         record.attempt += 1
         record.started_at = self.clock.now()
         record.timed_out = False
         record.token = CancellationToken()
-        values = {d: self._records[d].result.value for d in record.data_dependencies}
+        values: dict[str, Any] = {}
+        for dependency in record.data_dependencies:
+            details = self._records[dependency].result
+            assert details is not None
+            values[dependency] = details.value
         args, kwargs = self.inputs.resolve(record.inputs, values)
         request = ExecutionRequest(
             record.handle.id,
@@ -784,15 +929,17 @@ class EventLoopRuntime(Runtime):
             score=start.score,
         )
         attempt = record.attempt
+        loop = self._loop
+        assert loop is not None
 
-        def emit(kind, data):
+        def emit(kind: str, data: Mapping[str, Any]) -> None:
             message = _Message(
                 "runner_event", record.handle.run_id, record.handle.id, (attempt, kind, data)
             )
             # Python tasks can report from a worker thread.
-            self._loop.call_soon_threadsafe(self._timer_message, message)
+            loop.call_soon_threadsafe(self._timer_message, message)
 
-        async def execute():
+        async def execute() -> None:
             result, error = None, None
             context_token = _current_scope.set(None)
             try:
@@ -811,7 +958,7 @@ class EventLoopRuntime(Runtime):
                 )
             )
 
-        record.worker = self._loop.create_task(execute(), name=f"orchlet:{record.definition.name}")
+        record.worker = loop.create_task(execute(), name=f"orchlet:{record.definition.name}")
         if record.definition.timeout is not None:
             record.timer = self.clock.schedule_at(
                 self.clock.now() + record.definition.timeout,
@@ -820,7 +967,7 @@ class EventLoopRuntime(Runtime):
                 ),
             )
 
-    def _release(self, record):
+    def _release(self, record: _Record) -> None:
         if record.timer is not None:
             record.timer.cancel()
             record.timer = None
@@ -834,7 +981,13 @@ class EventLoopRuntime(Runtime):
         record.leases.clear()
         self._resource_state = ResourceSnapshot(self._resource_state.capacity, available)
 
-    async def _complete(self, record, attempt, result, error):
+    async def _complete(
+        self,
+        record: _Record,
+        attempt: int,
+        result: ExecutionResult[Any] | None,
+        error: BaseException | None,
+    ) -> None:
         if record.attempt != attempt or record.state not in (
             TaskState.RUNNING,
             TaskState.CANCELLING,
@@ -864,6 +1017,7 @@ class EventLoopRuntime(Runtime):
         if record.cancel_requested:
             await self._finish(record, TaskState.CANCELLED, error=error)
         elif error is None:
+            assert result is not None
             record.result = TaskResult(
                 result.value,
                 tuple(record.attempts),
@@ -902,7 +1056,9 @@ class EventLoopRuntime(Runtime):
                     record, TaskState.FAILED, error=TaskFailed(record.handle.id, error)
                 )
 
-    async def _finish(self, record, state, error=None):
+    async def _finish(
+        self, record: _Record, state: TaskState, error: BaseException | None = None
+    ) -> None:
         record.state, record.error = state, error
         if error is not None:
             cause = error.cause if isinstance(error, TaskFailed) else error
@@ -925,17 +1081,18 @@ class EventLoopRuntime(Runtime):
             state=state.value,
             error=str(error) if error else None,
         )
-        future = record.handle._future
+        future = self._completions[record.handle.id].future
         if not future.done():
             if error is None:
+                assert record.result is not None
                 future.set_result(record.result.value)
             else:
                 future.set_exception(error)
-        if not record.handle._admitted.done():
-            record.handle._admitted.set_exception(error or TaskCancelled("Not admitted"))
+        if not self._admissions[record.handle.id].done():
+            self._admissions[record.handle.id].set_exception(error or TaskCancelled("Not admitted"))
         self._dirty.update(self._dependents.get(record.handle.id, {}))
 
-    async def _cancel_record(self, record):
+    async def _cancel_record(self, record: _Record) -> None:
         if record.state.terminal:
             return
         record.cancel_requested = True
@@ -948,16 +1105,17 @@ class EventLoopRuntime(Runtime):
                 record, TaskState.CANCELLED, error=TaskCancelled("Task cancelled before execution")
             )
 
-    async def _cancel_scope_children(self, scope):
+    async def _cancel_scope_children(self, scope: _Scope) -> None:
         for node_id in scope.tasks:
             await self._cancel_record(self._records[node_id])
         for scope_id in scope.children:
             child = self._scopes[scope_id]
             if not child.flow_done:
+                assert child.worker is not None
                 child.worker.cancel()
             await self._cancel_scope_children(child)
 
-    async def _settle_scopes(self):
+    async def _settle_scopes(self) -> None:
         changed = True
         while changed:
             changed = False
@@ -966,9 +1124,15 @@ class EventLoopRuntime(Runtime):
                     continue
                 tasks = [self._records[node_id] for node_id in scope.tasks]
                 children = [self._scopes[scope_id] for scope_id in scope.children]
-                errors = [r.error for r in tasks if r.error is not None and not r.handle._observed]
+                errors = [
+                    r.error
+                    for r in tasks
+                    if r.error is not None and not self._completions[r.handle.id].observed
+                ]
                 errors += [
-                    c.error for c in children if c.error is not None and not c.handle._observed
+                    c.error
+                    for c in children
+                    if c.error is not None and not self._completions[c.handle.id].observed
                 ]
                 if scope.error is None and self.failures.fail_scope(errors):
                     scope.error = errors[0]
@@ -977,12 +1141,12 @@ class EventLoopRuntime(Runtime):
                     continue
                 scope.settled = True
                 if scope.error is None:
-                    scope.handle._future.set_result(scope.value)
+                    self._completions[scope.handle.id].future.set_result(scope.value)
                 else:
-                    scope.handle._future.set_exception(scope.error)
+                    self._completions[scope.handle.id].future.set_exception(scope.error)
                 changed = True
 
-    async def _settle_runs(self):
+    async def _settle_runs(self) -> None:
         for run_id, run in self._runs.items():
             if run.handle.done or run.keep_open or self._pending.get(run_id, 0):
                 continue
@@ -991,22 +1155,26 @@ class EventLoopRuntime(Runtime):
             if not root.settled or any(not r.state.terminal for r in external):
                 continue
             error = TaskCancelled("Run cancelled") if run.cancelled else root.error
-            errors = [r.error for r in external if r.error is not None and not r.handle._observed]
+            errors = [
+                r.error
+                for r in external
+                if r.error is not None and not self._completions[r.handle.id].observed
+            ]
             if error is None and self.failures.fail_scope(errors):
                 error = errors[0]
             await self._emit("run_finished", run_id, error=str(error) if error else None)
             if error is None:
-                run.handle._future.set_result(root.value)
+                self._completions[run.handle.id].future.set_result(root.value)
             else:
-                run.handle._future.set_exception(error)
+                self._completions[run.handle.id].future.set_exception(error)
 
-    async def _abort(self, error):
+    async def _abort(self, error: BaseException) -> None:
         """Fail all affected promises and await runner shutdown even if a plugin fails."""
         self._aborting = True
         if isinstance(error, asyncio.CancelledError):
             error = TaskCancelled("Runtime stopped")
         log_runtime_error(error)
-        workers = []
+        workers: list[asyncio.Task[None]] = []
         for scope in self._scopes.values():
             if scope.worker is not None and not scope.worker.done():
                 scope.worker.cancel()
@@ -1024,7 +1192,7 @@ class EventLoopRuntime(Runtime):
             if not record.state.terminal:
                 record.state, record.error = TaskState.FAILED, error
         for handle in self._handles.values():
-            for future in (handle._future, handle._admitted):
+            for future in (self._completions[handle.id].future, self._admissions[handle.id]):
                 if not future.done():
                     future.set_exception(error)
         try:
@@ -1035,11 +1203,11 @@ class EventLoopRuntime(Runtime):
         except Exception:
             pass  # The original plugin error remains the run's reported failure.
         for handle in self._scope_handles.values():
-            if not handle._future.done():
-                handle._future.set_exception(error)
+            if not self._completions[handle.id].future.done():
+                self._completions[handle.id].future.set_exception(error)
         for handle in self._run_handles.values():
             if not handle.done:
-                handle._future.set_exception(error)
+                self._completions[handle.id].future.set_exception(error)
         for ack in tuple(self._acks):
             if not ack.done():
                 ack.set_exception(error)

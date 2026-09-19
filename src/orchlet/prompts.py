@@ -1,14 +1,25 @@
+from __future__ import annotations
+
 import asyncio
 import inspect
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any
 
 from .contracts import PromptBuilder
+from .models import AttemptContext
 
 
 class FunctionPromptBuilder(PromptBuilder):
-    def __init__(self, include_feedback=True):
+    def __init__(self, include_feedback: bool = True) -> None:
         self.include_feedback = include_feedback
 
-    async def build(self, function, args, kwargs, attempt):
+    async def build(
+        self,
+        function: Callable[..., str | Awaitable[str]],
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+        attempt: AttemptContext,
+    ) -> str:
         if inspect.iscoroutinefunction(function):
             prompt = await function(*args, **kwargs)
         else:

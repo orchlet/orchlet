@@ -2,7 +2,7 @@
 
 import asyncio
 
-from orchlet import configure_logging, get_logger, EventLoopRuntime, flow, task
+from orchlet import EventLoopRuntime, FlowContext, configure_logging, flow, get_logger, task
 from orchlet.schedulers import WeightedScheduler
 from orchlet.weights import MetricWeight
 
@@ -10,17 +10,17 @@ logger = get_logger("examples.live_scheduling")
 
 
 @flow
-async def pipeline(ctx):
+async def pipeline(ctx: FlowContext) -> list[str]:
     started, release = asyncio.Event(), asyncio.Event()
-    order = []
+    order: list[str] = []
 
     @task(priority=1000)
-    async def blocker():
+    async def blocker() -> None:
         started.set()
         await release.wait()
 
     @task
-    async def work(name):
+    async def work(name: str) -> str:
         order.append(name)
         return name
 

@@ -1,10 +1,13 @@
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
 from math import isfinite
 
 from .contracts import ResourceAllocator
-from .models import AllocationPlan, ResourceSnapshot
+from .models import AllocationPlan, ResourceSnapshot, TaskView
 
 
-def _quantity(value, *, positive=False):
+def _quantity(value: object, *, positive: bool = False) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
         raise ValueError("Resource quantities must be finite numbers")
     if value < 0 or (positive and value == 0):
@@ -15,16 +18,16 @@ def _quantity(value, *, positive=False):
 class TokenResourceAllocator(ResourceAllocator):
     """Atomic vector reservations. Each task consumes at least one global slot."""
 
-    def __init__(self, global_slots=4, **capacities):
+    def __init__(self, global_slots: float = 4, **capacities: float) -> None:
         if "slots" in capacities or any(k.startswith("session:") for k in capacities):
             raise ValueError("slots and session:* capacities are managed by the allocator")
-        self.capacity = {"slots": _quantity(global_slots, positive=True)}
+        self.capacity: dict[str, float] = {"slots": _quantity(global_slots, positive=True)}
         self.capacity.update({k: _quantity(v) for k, v in capacities.items()})
 
-    def initial(self):
+    def initial(self) -> ResourceSnapshot:
         return ResourceSnapshot(self.capacity, self.capacity)
 
-    def requirements(self, task):
+    def requirements(self, task: TaskView) -> Mapping[str, float]:
         requirements = {"slots": 1.0, **task.resources}
         requirements = {key: _quantity(value) for key, value in requirements.items()}
         if requirements["slots"] < 1:
@@ -34,9 +37,9 @@ class TokenResourceAllocator(ResourceAllocator):
                 raise ValueError("Session reservations must be exclusive")
         return requirements
 
-    def plan(self, tasks, resources):
+    def plan(self, tasks: Sequence[TaskView], resources: ResourceSnapshot) -> AllocationPlan | None:
         available, capacity = dict(resources.available), dict(resources.capacity)
-        reservations = {}
+        reservations: dict[str, Mapping[str, float]] = {}
         for task in tasks:
             if task.id in reservations:
                 raise ValueError("Duplicate task in resource plan")

@@ -1,6 +1,6 @@
 # Orchlet examples
 
-Run these commands from the repository root with a Python environment active:
+Run these commands from the repository root with a Python 3.14+ environment active:
 
 ```bash
 python -m pip install -e .

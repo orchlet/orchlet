@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Concatenate, Protocol
 
 from .models import (
     AgentReply,
@@ -27,15 +27,39 @@ from .models import (
     TaskView,
 )
 
+if TYPE_CHECKING:
+    from .definitions import FlowDef
+    from .handles import OutputRef, RunHandle, TaskHandle
+    from .runners import CancellationToken
+    from .runtime import FlowContext
+
+type Emit = Callable[[str, Mapping[str, Any]], None]
+
 
 class Runtime(ABC):
     @abstractmethod
-    async def arun(self, flow, *args, **kwargs): ...
+    async def arun[**P, T](
+        self,
+        flow: FlowDef[P, T] | Callable[Concatenate[FlowContext, P], Awaitable[T]],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> T: ...
 
     @abstractmethod
-    def start(self, flow, *args, keep_open=False, **kwargs): ...
+    def start[T](
+        self,
+        flow: FlowDef[..., T] | Callable[..., Awaitable[T]],
+        *args: Any,
+        keep_open: bool = False,
+        **kwargs: Any,
+    ) -> RunHandle[T]: ...
 
-    def run(self, flow, *args, **kwargs):
+    def run[**P, T](
+        self,
+        flow: FlowDef[P, T] | Callable[Concatenate[FlowContext, P], Awaitable[T]],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> T:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -43,20 +67,22 @@ class Runtime(ABC):
         raise RuntimeError("Use 'await runtime.arun(...)' inside an event loop")
 
 
-class FlowController(ABC):
+class FlowController[T_co](ABC):
     @abstractmethod
-    async def run(self, context, args, kwargs): ...
+    async def run(
+        self, context: FlowContext, args: tuple[Any, ...], kwargs: Mapping[str, Any]
+    ) -> T_co: ...
 
 
 class InputResolver(ABC):
     @abstractmethod
-    def references(self, value): ...
+    def references(self, value: Any) -> Sequence[TaskHandle[Any] | OutputRef[Any]]: ...
 
     @abstractmethod
-    def capture(self, value): ...
+    def capture(self, value: Any) -> Any: ...
 
     @abstractmethod
-    def resolve(self, value, results): ...
+    def resolve(self, value: Any, results: Mapping[str, Any]) -> Any: ...
 
 
 class DependencyPolicy(ABC):
@@ -81,7 +107,7 @@ class Scheduler(ABC):
     def observe(self, event: RuntimeEvent) -> None:
         """Optional sequential observation of runtime events."""
 
-    def bind_resources(self, resources):
+    def bind_resources(self, resources: ResourceAllocator) -> None:
         """Optional binding to the allocator used to validate actual reservations."""
 
 
@@ -125,9 +151,9 @@ class Runner(ABC):
     async def execute(
         self,
         request: ExecutionRequest,
-        emit: Callable[[str, Mapping], None],
-        cancellation: Any,
-    ) -> ExecutionResult: ...
+        emit: Emit,
+        cancellation: CancellationToken,
+    ) -> ExecutionResult[Any]: ...
 
 
 class AgentBackend(ABC):
@@ -137,26 +163,30 @@ class AgentBackend(ABC):
     async def run_turn(
         self,
         request: AgentRequest,
-        emit: Callable[[str, Mapping], None],
-        cancellation: Any,
+        emit: Emit,
+        cancellation: CancellationToken,
     ) -> AgentReply: ...
 
 
 class PromptBuilder(ABC):
     @abstractmethod
     async def build(
-        self, function: Callable, args: tuple, kwargs: Mapping, attempt: AttemptContext
+        self,
+        function: Callable[..., str | Awaitable[str]],
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+        attempt: AttemptContext,
     ) -> str: ...
 
 
-class OutputCodec(ABC):
+class OutputCodec[T_co](ABC):
     @abstractmethod
-    def decode(self, raw: str) -> Any: ...
+    def decode(self, raw: str) -> T_co: ...
 
 
-class ResultValidator(ABC):
+class ResultValidator[T_co](ABC):
     @abstractmethod
-    def validate(self, value: Any, context: AttemptContext) -> Any:
+    def validate(self, value: Any, context: AttemptContext) -> T_co:
         """Return a validated value or raise; never silently ignore invalid output."""
 
 
@@ -178,22 +208,22 @@ class StateStore(ABC):
     ) -> StateSnapshot: ...
 
 
-class EventTransport(ABC):
+class EventTransport[M](ABC):
     @abstractmethod
-    def open(self):
+    def open(self) -> None:
         """Bind/reset the local nonblocking ingress for a new engine lifetime."""
 
     @abstractmethod
-    def send(self, message): ...
+    def send(self, message: M) -> None: ...
 
     @abstractmethod
-    async def receive(self): ...
+    async def receive(self) -> M: ...
 
     @abstractmethod
-    def drain(self, limit): ...
+    def drain(self, limit: int) -> Sequence[M]: ...
 
     @abstractmethod
-    def empty(self): ...
+    def empty(self) -> bool: ...
 
 
 class EventJournal(ABC):
@@ -204,19 +234,23 @@ class EventJournal(ABC):
     def read(self) -> Sequence[RuntimeEvent]: ...
 
 
+class Timer(Protocol):
+    def cancel(self) -> None: ...
+
+
 class Clock(ABC):
     @abstractmethod
     def now(self) -> float: ...
 
     @abstractmethod
-    def schedule_at(self, when, callback): ...
+    def schedule_at(self, when: float, callback: Callable[[], None]) -> Timer: ...
 
-    async def sleep(self, delay):
+    async def sleep(self, delay: float) -> None:
         if delay < 0:
             raise ValueError("delay must be nonnegative")
-        future = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
-        def wake():
+        def wake() -> None:
             if not future.done():
                 future.set_result(None)
 

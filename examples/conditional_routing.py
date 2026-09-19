@@ -2,43 +2,55 @@
 
 import argparse
 
-from orchlet import configure_logging, get_logger, AgentBackend, EventLoopRuntime, agent, flow
+from orchlet import (
+    AgentBackend,
+    EventLoopRuntime,
+    FlowContext,
+    agent,
+    configure_logging,
+    flow,
+    get_logger,
+)
+from orchlet.contracts import Emit
 from orchlet.errors import TaskFailed
-from orchlet.models import AgentReply
+from orchlet.models import AgentReply, AgentRequest
+from orchlet.runners import CancellationToken
 
 logger = get_logger("examples.conditional_routing")
 
 
-def require_lgtm(text):
+def require_lgtm(text: str) -> None:
     # Require a standalone LGTM line so that "not LGTM" does not count as approval.
     if not any(line.strip().upper() == "LGTM" for line in text.splitlines()):
         raise ValueError("Review failed: no standalone LGTM line")
 
 
 @agent(backend="demo", validate=require_lgtm)
-def review(code):
+def review(code: str) -> str:
     return f"Review this code. If approved, write LGTM on its own line; otherwise explain:\n{code}"
 
 
 @agent(backend="demo")
-def repair(code, feedback, error):
+def repair(code: str, feedback: str, error: str) -> str:
     return f"Repair this code:\n{code}\nReview feedback:\n{feedback}\nFailure reason: {error}"
 
 
 @agent(backend="demo")
-def summarize(code, review_text):
+def summarize(code: str, review_text: str) -> str:
     return f"Write a description of this approved code:\n{code}\nReview result:\n{review_text}"
 
 
 @flow
-async def pipeline(ctx, code):
+async def pipeline(ctx: FlowContext, code: str) -> str:
     job = ctx.submit(review, code)
     try:
         review_text = await job
     except TaskFailed as exc:
         logger.warning("Failure branch -> repair; reason: %s", exc.cause)
         # Pass the response text. A failed handle as input would skip the downstream task.
-        return await ctx.submit(repair, code, job.details.raw_text or "", str(exc.cause))
+        details = job.details
+        assert details is not None
+        return await ctx.submit(repair, code, details.raw_text or "", str(exc.cause))
     else:
         logger.info("  Success branch -> summarize")
         return await ctx.submit(summarize, code, review_text)
@@ -47,10 +59,12 @@ async def pipeline(ctx, code):
 class DemoBackend(AgentBackend):
     """Return local demo responses without executing code or calling a model."""
 
-    def __init__(self, case):
+    def __init__(self, case: str) -> None:
         self.case = case
 
-    async def run_turn(self, request, emit, cancellation):
+    async def run_turn(
+        self, request: AgentRequest, emit: Emit, cancellation: CancellationToken
+    ) -> AgentReply:
         name = request.task_id.rsplit(":", 1)[-1]
         if name == "review":
             text = (
@@ -67,7 +81,7 @@ class DemoBackend(AgentBackend):
         return AgentReply(text)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", choices=("success", "failure", "both"), default="both")
     args = parser.parse_args()

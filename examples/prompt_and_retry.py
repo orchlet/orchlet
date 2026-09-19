@@ -1,30 +1,41 @@
 """Replace PromptBuilder to include previous responses and errors in repair prompts."""
 
-from dataclasses import dataclass
 import json
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from typing import Any
 
 from orchlet import (
-    configure_logging,
-    get_logger,
     AgentBackend,
     EventLoopRuntime,
+    FlowContext,
     PromptBuilder,
     agent,
+    configure_logging,
     flow,
+    get_logger,
 )
-from orchlet.models import AgentReply
+from orchlet.contracts import Emit
+from orchlet.models import AgentReply, AgentRequest, AttemptContext
 from orchlet.policies import ExponentialRetry
 from orchlet.prompts import FunctionPromptBuilder
+from orchlet.runners import CancellationToken
 
 logger = get_logger("examples.prompt_and_retry")
 
 
 class RepairPromptBuilder(PromptBuilder):
-    def __init__(self):
+    def __init__(self) -> None:
         # Reuse Python prompt function invocation and define the feedback format below.
         self.base = FunctionPromptBuilder(include_feedback=False)
 
-    async def build(self, function, args, kwargs, attempt):
+    async def build(
+        self,
+        function: Callable[..., str | Awaitable[str]],
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+        attempt: AttemptContext,
+    ) -> str:
         requirement = await self.base.build(function, args, kwargs, attempt)
         if attempt.previous_error is None:
             return requirement
@@ -43,7 +54,7 @@ class Rating:
     score: float
 
 
-def check_score(rating):
+def check_score(rating: Rating) -> None:
     if not 0 <= rating.score <= 10:
         raise ValueError(f"score must be between 0 and 10; received {rating.score}")
 
@@ -55,7 +66,7 @@ def check_score(rating):
     prompt_builder=RepairPromptBuilder(),
     retry=ExponentialRetry(max_attempts=3, delay=0.01),
 )
-def rate(singer, detailed=False):
+def rate(singer: str, detailed: bool = False) -> str:
     criteria = (
         ["vocal ability", "songs", "stage performance"] if detailed else ["overall performance"]
     )
@@ -66,17 +77,21 @@ def rate(singer, detailed=False):
 
 
 @flow
-async def pipeline(ctx):
+async def pipeline(ctx: FlowContext) -> Rating:
     job = ctx.submit(rate, "Singer A", detailed=True)
     rating = await job
     logger.info(f"Final {type(rating).__name__} object: {rating}")
-    for attempt in job.details.attempts:
+    details = job.details
+    assert details is not None
+    for attempt in details.attempts:
         logger.info(f"  Attempt {attempt.number}: {attempt.error or 'succeeded'}")
     return rating
 
 
 class DemoBackend(AgentBackend):
-    async def run_turn(self, request, emit, cancellation):
+    async def run_turn(
+        self, request: AgentRequest, emit: Emit, cancellation: CancellationToken
+    ) -> AgentReply:
         responses = [
             "This response is not JSON",
             json.dumps({"singer": "Singer A", "score": 99}),

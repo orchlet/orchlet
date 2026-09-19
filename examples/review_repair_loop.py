@@ -3,25 +3,35 @@
 import argparse
 from dataclasses import dataclass
 
-from orchlet import configure_logging, get_logger, AgentBackend, EventLoopRuntime, agent, flow
+from orchlet import (
+    AgentBackend,
+    EventLoopRuntime,
+    FlowContext,
+    agent,
+    configure_logging,
+    flow,
+    get_logger,
+)
+from orchlet.contracts import Emit
 from orchlet.errors import TaskFailed
-from orchlet.models import AgentReply
+from orchlet.models import AgentReply, AgentRequest
+from orchlet.runners import CancellationToken
 
 logger = get_logger("examples.review_repair_loop")
 
 
-def require_lgtm(text):
+def require_lgtm(text: str) -> None:
     if text.strip().upper() != "LGTM":
         raise ValueError("Review failed: the code needs changes")
 
 
 @agent(backend="demo", validate=require_lgtm)
-def review(code):
+def review(code: str) -> str:
     return f"Review the add function. Reply with only LGTM if approved, or explain the changes:\n{code}"
 
 
 @agent(backend="demo")
-def repair(code, feedback):
+def repair(code: str, feedback: str) -> str:
     return f"Fix the code using the review feedback. Return only code.\nCode:\n{code}\nFeedback:\n{feedback}"
 
 
@@ -34,13 +44,17 @@ class ReviewResult:
 
 
 @flow
-async def review_until_approved(ctx, code, max_rounds):
+async def review_until_approved(ctx: FlowContext, code: str, max_rounds: int) -> ReviewResult:
+    if max_rounds < 1:
+        raise ValueError("max_rounds must be positive")
     for round_number in range(1, max_rounds + 1):
         job = ctx.submit(review, code)
         try:
             feedback = await job
         except TaskFailed as exc:
-            feedback = job.details.raw_text or str(exc.cause)
+            details = job.details
+            assert details is not None
+            feedback = details.raw_text or str(exc.cause)
             logger.warning("Review round %s failed: %s", round_number, feedback)
             if round_number == max_rounds:
                 return ReviewResult(False, round_number, code, feedback)
@@ -50,13 +64,16 @@ async def review_until_approved(ctx, code, max_rounds):
         else:
             logger.info(f"Review round {round_number} approved")
             return ReviewResult(True, round_number, code, feedback)
+    raise AssertionError("Review loop must return on its final round")
 
 
 class DemoBackend(AgentBackend):
-    def __init__(self, stubborn=False):
+    def __init__(self, stubborn: bool = False) -> None:
         self.stubborn = stubborn
 
-    async def run_turn(self, request, emit, cancellation):
+    async def run_turn(
+        self, request: AgentRequest, emit: Emit, cancellation: CancellationToken
+    ) -> AgentReply:
         name = request.task_id.rsplit(":", 1)[-1]
         if name == "review":
             text = (
@@ -70,7 +87,7 @@ class DemoBackend(AgentBackend):
         return AgentReply(text)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--max-rounds", type=int, default=3)
     parser.add_argument(

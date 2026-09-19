@@ -1,7 +1,10 @@
 import unittest
+from collections.abc import Sequence
+from typing import Any
 
+from orchlet import Scheduler
 from orchlet.errors import RevisionConflict, SchedulingError
-from orchlet.models import Ordering, ScheduleSnapshot, TaskState, TaskView
+from orchlet.models import Ordering, ScheduleDecision, ScheduleSnapshot, TaskState, TaskView
 from orchlet.priorities import ExplicitPriorityOrder, NumericPriorityOrder
 from orchlet.resources import TokenResourceAllocator
 from orchlet.schedulers import PartialOrderScheduler, WeightedScheduler
@@ -9,13 +12,20 @@ from orchlet.state import MemoryStateStore
 from orchlet.weights import AgingWeight, FunctionWeight, MetricWeight
 
 
-def node(name, priority=0, sequence=0, **kwargs):
+def node(name: str, priority: int | str = 0, sequence: int = 0, **kwargs: Any) -> TaskView:
     return TaskView(
         name, "run", "scope", name, TaskState.READY, priority=priority, sequence=sequence, **kwargs
     )
 
 
-def choose(scheduler, tasks, *, slots=1, now=10, **capacities):
+def choose(
+    scheduler: Scheduler,
+    tasks: Sequence[TaskView],
+    *,
+    slots: int = 1,
+    now: float = 10,
+    **capacities: float,
+) -> ScheduleDecision:
     allocator = TokenResourceAllocator(slots, **capacities)
     scheduler.bind_resources(allocator)
     snapshot = ScheduleSnapshot(0, now, tuple(tasks), (), allocator.initial())
@@ -86,7 +96,10 @@ class SchedulingTests(unittest.TestCase):
 
     def test_invalid_weight_fails_explicitly(self):
         with self.assertRaises(SchedulingError):
-            choose(WeightedScheduler(weights=FunctionWeight(lambda *_: float("nan"))), [node("a")])
+            choose(
+                WeightedScheduler(weights=FunctionWeight(lambda _task, _snapshot: float("nan"))),
+                [node("a")],
+            )
 
     def test_snapshots_freeze_nested_metadata(self):
         original = {"nested": {"items": [1, 2]}}

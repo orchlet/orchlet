@@ -1,35 +1,42 @@
 import asyncio
-from contextlib import redirect_stderr, redirect_stdout
-from io import StringIO
 import logging
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 from rich.logging import RichHandler
 
-from orchlet import EventLoopRuntime, configure_logging, flow, get_logger, task
+from orchlet import EventLoopRuntime, FlowContext, configure_logging, flow, get_logger, task
 from orchlet.events import JsonlJournal
 from orchlet.logging import log_event
-from orchlet.models import RuntimeEvent
+from orchlet.models import RuntimeEvent, ScheduleDecision, ScheduleSnapshot
 from orchlet.policies import ExponentialRetry
 from orchlet.schedulers import PartialOrderScheduler
+
+
+def event_of(record: logging.LogRecord) -> RuntimeEvent:
+    event = getattr(record, "orchlet_event", None)
+    assert isinstance(event, RuntimeEvent)
+    return event
 
 
 class RecordHandler(logging.Handler):
     def __init__(self):
         super().__init__()
-        self.records = []
+        self.records: list[logging.LogRecord] = []
 
-    def emit(self, record):
+    def emit(self, record: logging.LogRecord) -> None:
         self.records.append(record)
 
 
 class BrokenHandler(logging.Handler):
-    def emit(self, record):
+    def emit(self, record: logging.LogRecord) -> None:
         raise RuntimeError("Log destination is unavailable")
 
 
@@ -37,7 +44,7 @@ class LoggingTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.package = get_logger()
         self.runtime_logger = get_logger("runtime")
-        self.saved = []
+        self.saved: list[tuple[logging.Logger, list[logging.Handler], int, bool, bool]] = []
         for logger in (logging.getLogger(), self.package, self.runtime_logger):
             self.saved.append(
                 (logger, list(logger.handlers), logger.level, logger.propagate, logger.disabled)
@@ -50,7 +57,7 @@ class LoggingTests(unittest.IsolatedAsyncioTestCase):
         self.runtime_logger.setLevel(logging.NOTSET)
         self.runtime_logger.propagate = True
         self.runtime_logger.disabled = False
-        self.runtimes = []
+        self.runtimes: list[EventLoopRuntime] = []
 
     async def asyncTearDown(self):
         for runtime in self.runtimes:
@@ -66,7 +73,7 @@ class LoggingTests(unittest.IsolatedAsyncioTestCase):
             logger.propagate = propagate
             logger.disabled = disabled
 
-    def runtime(self, **kwargs):
+    def runtime(self, **kwargs: Any) -> EventLoopRuntime:
         runtime = EventLoopRuntime(**kwargs)
         self.runtimes.append(runtime)
         return runtime
@@ -147,7 +154,7 @@ class LoggingTests(unittest.IsolatedAsyncioTestCase):
             raise ValueError("Expected task failure")
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             return await ctx.all_settled([ctx.submit(flaky), ctx.submit(fail)])
 
         with tempfile.TemporaryDirectory() as directory:
@@ -155,15 +162,15 @@ class LoggingTests(unittest.IsolatedAsyncioTestCase):
             outcomes = await self.runtime(journal=journal).arun(pipeline)
             self.assertEqual(outcomes[0].value, 42)
             self.assertFalse(outcomes[1].succeeded)
-            self.assertEqual(tuple(r.orchlet_event for r in capture.records), journal.read())
+            self.assertEqual(tuple(event_of(r) for r in capture.records), journal.read())
         records = capture.records
-        retries = [r for r in records if r.orchlet_event.kind == "task_retry"]
+        retries = [r for r in records if event_of(r).kind == "task_retry"]
         self.assertEqual([r.levelno for r in retries], [logging.WARNING])
-        failures = [r for r in records if r.orchlet_event.data.get("state") == "failed"]
+        failures = [r for r in records if event_of(r).data.get("state") == "failed"]
         self.assertEqual([r.levelno for r in failures], [logging.ERROR])
         self.assertTrue(any(r.levelno == logging.DEBUG for r in records))
         for record in records:
-            event = record.orchlet_event
+            event = event_of(record)
             if event.task_id is not None:
                 self.assertIn(event.task_id, record.getMessage())
         self.assertIn("Retry this operation", output.getvalue())
@@ -172,7 +179,7 @@ class LoggingTests(unittest.IsolatedAsyncioTestCase):
         capture = RecordHandler()
         self.package.setLevel(logging.DEBUG)
         self.package.addHandler(capture)
-        cases = [
+        cases: list[tuple[str, dict[str, str], int]] = [
             ("task_timeout", {}, logging.WARNING),
             ("task_finished", {"state": "skipped"}, logging.WARNING),
             ("task_finished", {"state": "cancelled"}, logging.INFO),
@@ -192,13 +199,13 @@ class LoggingTests(unittest.IsolatedAsyncioTestCase):
             return 42
 
         @flow
-        async def pipeline(ctx):
+        async def pipeline(ctx: FlowContext):
             return await ctx.submit(value)
 
         self.assertEqual(await self.runtime().arun(pipeline), 42)
 
         class BrokenScheduler(PartialOrderScheduler):
-            def schedule(self, snapshot):
+            def schedule(self, snapshot: ScheduleSnapshot) -> ScheduleDecision:
                 raise RuntimeError("Scheduling failed")
 
         with self.assertRaisesRegex(RuntimeError, "Scheduling failed"):
