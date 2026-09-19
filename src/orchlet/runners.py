@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+import asyncio
+import inspect
+from dataclasses import dataclass
+
+from .contracts import Runner
+from .errors import ConfigurationError, OutputValidationError, TaskCancelled
+from .models import AgentRequest, ExecutionResult
+
+
+class CancellationToken:
+    def __init__(self):
+        self._event = asyncio.Event()
+
+    def request(self):
+        self._event.set()
+
+    @property
+    def requested(self):
+        return self._event.is_set()
+
+    async def wait(self):
+        await self._event.wait()
+
+
+@dataclass(frozen=True)
+class TaskContext:
+    task_id: str
+    attempt: int
+    cancellation: CancellationToken
+    _emit: object
+
+    def report(self, **metrics):
+        self._emit("metrics", metrics)
+
+
+async def _cancellable(work, cancellation, *, can_cancel=True):
+    async def guarded():
+        try:
+            return await work
+        except (SystemExit, KeyboardInterrupt) as exc:
+            raise RuntimeError(f"Leaf execution raised {type(exc).__name__}: {exc}") from exc
+
+    job = asyncio.create_task(guarded())
+    watcher = asyncio.create_task(cancellation.wait())
+    try:
+        done, _ = await asyncio.wait((job, watcher), return_when=asyncio.FIRST_COMPLETED)
+        if watcher in done and cancellation.requested:
+            if can_cancel:
+                job.cancel()
+            # A running thread cannot be killed: retain its reservation until it exits.
+            await asyncio.gather(job, return_exceptions=True)
+            raise TaskCancelled("Execution cancelled after runner stopped")
+        return await job
+    finally:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+        if not job.done():
+            if can_cancel:
+                job.cancel()
+            await asyncio.gather(job, return_exceptions=True)
+
+
+class PythonRunner(Runner):
+    async def execute(self, request, emit, cancellation):
+        fn, args = request.definition.function, request.args
+        if request.definition.context:
+            args = (TaskContext(request.task_id, request.attempt.number, cancellation, emit), *args)
+        asynchronous = inspect.iscoroutinefunction(fn)
+        work = (
+            fn(*args, **request.kwargs)
+            if asynchronous
+            else asyncio.to_thread(fn, *args, **request.kwargs)
+        )
+        value = await _cancellable(work, cancellation, can_cancel=asynchronous)
+        if inspect.isawaitable(value):
+            # Don't leak a coroutine returned accidentally by a sync callable.
+            if inspect.iscoroutine(value):
+                value.close()
+            raise TypeError("Declare coroutine tasks with 'async def'")
+        if request.definition.validator is not None:
+            value = request.definition.validator.validate(value, request.attempt)
+        return ExecutionResult(value)
+
+
+class AgentRunner(Runner):
+    def __init__(self, backends):
+        self.backends = dict(backends)
+
+    async def execute(self, request, emit, cancellation):
+        definition = request.definition
+        backend = (
+            self.backends.get(definition.backend)
+            if isinstance(definition.backend, str)
+            else definition.backend
+        )
+        if backend is None:
+            raise ConfigurationError(f"Unregistered agent backend: {definition.backend!r}")
+        session_id = definition.session.bind(request.task_id, request.attempt)
+        if session_id and not backend.supports_resume:
+            raise ConfigurationError("This backend does not support continuing a session")
+        prompt = await definition.prompt_builder.build(
+            definition.function,
+            request.args,
+            request.kwargs,
+            request.attempt,
+        )
+        if cancellation.requested:
+            raise TaskCancelled("Cancelled while preparing agent prompt")
+        reply = await backend.run_turn(
+            AgentRequest(prompt, request.task_id, request.attempt.number, session_id),
+            emit,
+            cancellation,
+        )
+        try:
+            value = definition.codec.decode(reply.text)
+            if definition.validator is not None:
+                value = definition.validator.validate(value, request.attempt)
+        except Exception as exc:
+            raise OutputValidationError(str(exc), reply.text) from exc
+        return ExecutionResult(value, reply.text, reply.stdout, reply.stderr, reply.session_id)
+
+
+class SimulatedRunner(Runner):
+    """Deterministic duration/result functions can be keyed by request inputs or metadata."""
+
+    def __init__(self, result, duration=1.0):
+        self.result = result
+        self.duration = duration
+
+    async def execute(self, request, emit, cancellation):
+        duration = self.duration(request) if callable(self.duration) else self.duration
+        await _cancellable(request.clock.sleep(duration), cancellation)
+        value = self.result(request) if callable(self.result) else self.result
+        if request.definition.validator is not None:
+            value = request.definition.validator.validate(value, request.attempt)
+        return ExecutionResult(value)
