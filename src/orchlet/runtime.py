@@ -104,8 +104,15 @@ _current_scope: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 
 @dataclass(frozen=True)
 class SubmitOptions:
+    """Per-submission dependencies and an optional identity within the parent scope."""
+
     after: tuple[TaskHandle[Any], ...] = ()
     dependency_policy: DependencyPolicy | None = None
+    key: str | None = field(default=None, kw_only=True)
+
+    def __post_init__(self) -> None:
+        if self.key is not None and (not isinstance(cast(object, self.key), str) or not self.key):
+            raise ValueError("Submission keys must be nonempty strings or None")
 
 
 @dataclass
@@ -204,10 +211,18 @@ class _Run:
 
 
 class FlowContext:
-    def __init__(self, runtime: RuntimeBridge, run_id: str, scope_id: str) -> None:
+    def __init__(
+        self,
+        runtime: RuntimeBridge,
+        run_id: str,
+        scope_id: str,
+        *,
+        options: SubmitOptions | None = None,
+    ) -> None:
         self._runtime = runtime
         self.run_id: str = run_id
         self.scope_id: str = scope_id
+        self._options = options if options is not None else SubmitOptions()
 
     @property
     def artifacts_dir(self) -> Path:
@@ -217,6 +232,16 @@ class FlowContext:
         if _current_scope.get() != self.scope_id:
             raise RuntimeError("Submit children from a flow/subflow, not from a running leaf task")
 
+    def with_options(self, options: SubmitOptions) -> FlowContext:
+        """Return a view of this scope with new immutable submission defaults.
+
+        This creates no scope or node. Options replace any defaults on this view;
+        an explicit submit/asubmit options argument overrides the view entirely.
+        Subflows accept only key; dependency options belong to task submissions.
+        """
+        self._check()
+        return FlowContext(self._runtime, self.run_id, self.scope_id, options=options)
+
     def submit[T](
         self,
         definition: TaskDef[..., T],
@@ -225,7 +250,14 @@ class FlowContext:
         **kwargs: Any,
     ) -> TaskHandle[T]:
         self._check()
-        return self._runtime.submit(self.run_id, self.scope_id, definition, args, kwargs, options)
+        return self._runtime.submit(
+            self.run_id,
+            self.scope_id,
+            definition,
+            args,
+            kwargs,
+            options if options is not None else self._options,
+        )
 
     async def asubmit[T](
         self,
@@ -241,7 +273,7 @@ class FlowContext:
             definition,
             args,
             kwargs,
-            options,
+            options if options is not None else self._options,
             deferred=True,
         )
         await await_shared(self._runtime.admission(handle.id))
@@ -254,7 +286,11 @@ class FlowContext:
         **kwargs: P.kwargs,
     ) -> FlowHandle[T]:
         self._check()
-        return self._runtime.subflow(self.run_id, self.scope_id, definition, args, kwargs)
+        if self._options.after or self._options.dependency_policy is not None:
+            raise ValueError("Subflow submission options support only key, not task dependencies")
+        return self._runtime.subflow(
+            self.run_id, self.scope_id, definition, args, kwargs, key=self._options.key
+        )
 
     async def all_settled[T](
         self, handles: Iterable[TaskHandle[T] | FlowHandle[T]]
@@ -383,8 +419,9 @@ class EventLoopRuntime(Runtime):
     tasks get a new attempt. Completed runs start fresh. Pass resume=False to
     deliberately start over, or run_key to name an invocation independently of argv.
 
-    Controllers run again to reconstruct dynamic submissions. Keep their order
-    deterministic, pass changing data as explicit inputs, and put side effects in
+    Controllers run again to reconstruct dynamic submissions. Give reordered
+    nodes stable keys, keep positional submission order deterministic, pass
+    changing data as explicit inputs, and put side effects in
     tasks that tolerate interrupted execution. External submissions to keep_open
     runs must be submitted again by the caller. Results must support the selected
     CheckpointCodec; the default pickle codec requires trusted local run files.
@@ -445,6 +482,7 @@ class EventLoopRuntime(Runtime):
         self._resumed: set[str] = set()
         self._invocations: dict[str, int] = {}
         self._sequences: dict[str, int] = {}
+        self._logical_keys: dict[tuple[str, str], str] = {}
         self.runners: dict[str, Runner] = {
             "python": PythonRunner(),
             "agent": AgentRunner(backends or {}),
@@ -670,24 +708,29 @@ class EventLoopRuntime(Runtime):
             if isinstance(ref, TaskHandle):
                 if self._handles.get(ref.id) is not ref or ref.run_id != run_id:
                     raise ValueError("Dependencies must belong to this Runtime and run")
-                self._completions[ref.id].observed = True
             elif isinstance(cast(object, ref), OutputRef):
                 if ref.run_id != run_id or ref.task_id not in self._handles:
                     raise ValueError("Unknown or cross-run input reference")
             else:
                 raise TypeError("Control dependencies must be TaskHandles")
-        task_id = self._next_id(scope_id or f"{run_id}/external", "task", definition.name)
+        inputs = self.inputs.capture((args, kwargs))
+        task_id = self._next_id(
+            scope_id or f"{run_id}/external", "task", definition.name, key=options.key
+        )
+        for ref in (*references, *controls):
+            if isinstance(ref, TaskHandle):
+                self._completions[ref.id].observed = True
         completion = Completion[T](quiet_future(asyncio.get_running_loop().create_future()))
         admitted: asyncio.Future[None] = quiet_future(asyncio.get_running_loop().create_future())
         self._completions[task_id] = completion
         self._admissions[task_id] = admitted
-        handle = TaskHandle[T](self._bridge, task_id, run_id, completion)
+        handle = TaskHandle[T](self._bridge, task_id, run_id, completion, key=options.key)
         self._handles[task_id] = handle
         record = _Record(
             handle,
             definition,
             scope_id,
-            self.inputs.capture((args, kwargs)),
+            inputs,
             tuple(
                 dict.fromkeys(r.id if isinstance(r, TaskHandle) else r.task_id for r in references)
             ),
@@ -721,38 +764,47 @@ class EventLoopRuntime(Runtime):
             if isinstance(definition, FlowDef)
             else FlowDef[..., T](CoroutineFlowController[..., T](definition), definition.__name__)
         )
-        scope_id = (
-            self._next_id(parent, "flow", definition.name)
-            if key is None
-            else f"{parent}/flow-key:{quote(key, safe='')}:{quote(definition.name, safe='')}"
-        )
-        if scope_id in self._scope_handles:
-            raise ValueError(f"Duplicate flow identity: {scope_id}")
+        scope_id = self._next_id(parent, "flow", definition.name, key=key)
         completion = Completion[T](quiet_future(asyncio.get_running_loop().create_future()))
         self._completions[scope_id] = completion
-        handle = FlowHandle[T](self._bridge, scope_id, run_id, completion)
+        handle = FlowHandle[T](self._bridge, scope_id, run_id, completion, key=key)
         self._scope_handles[scope_id] = handle
         self._post(_Message("subflow", run_id, payload=(handle, parent, definition, args, kwargs)))
         return handle
 
-    def _next_id(self, parent: str, kind: str, name: str) -> str:
-        key = f"{parent}/{kind}"
-        number = self._sequences.get(key, 0) + 1
-        self._sequences[key] = number
-        return f"{key}-{number}:{quote(name, safe='')}"
+    def _next_id(self, parent: str, kind: str, name: str, *, key: str | None = None) -> str:
+        if key is not None:
+            if not isinstance(cast(object, key), str) or not key:
+                raise ValueError("Submission keys must be nonempty strings or None")
+            identity = (parent, key)
+            if identity in self._logical_keys:
+                raise ValueError(f"Duplicate submission key {key!r} in {parent}")
+            node_id = f"{parent}/{kind}-key:{quote(key, safe='')}:{quote(name, safe='')}"
+            self._logical_keys[identity] = node_id
+            return node_id
+        counter = f"{parent}/{kind}"
+        number = self._sequences.get(counter, 0) + 1
+        self._sequences[counter] = number
+        return f"{counter}-{number}:{quote(name, safe='')}"
 
     def result_details(self, task_id: str) -> TaskResult[Any] | None:
         record = self._records.get(task_id)
         return record.result if record else None
 
-    async def _check_slot(self, run_id: str, node_id: str) -> None:
+    async def _check_slot(self, run_id: str, node_id: str, *, key: str | None = None) -> None:
         slot = node_id.rsplit(":", 1)[0]
-        path = self.artifacts.run_dir(run_id) / "slots" / f"{fingerprint(slot)}.json"
-        if run_id in self._resumed and path.exists() and read_json(path)["id"] != node_id:
-            raise RecoveryError(
-                f"Submission order changed at {slot}; use resume=False for a new run"
-            )
-        await write_json(path, {"id": node_id})
+        directory = self.artifacts.run_dir(run_id) / "slots"
+        legacy = directory / f"{fingerprint(slot)}.json"
+        parent = node_id.rpartition("/")[0]
+        path = legacy if key is None else directory / f"{fingerprint(('key', parent, key))}.json"
+        # Read the original batch-key slot as well, so existing checkpoints stay valid.
+        if run_id in self._resumed:
+            for candidate in dict.fromkeys((path, legacy)):
+                if candidate.exists() and read_json(candidate)["id"] != node_id:
+                    raise RecoveryError(
+                        f"Submission identity changed at {slot}; use resume=False for a new run"
+                    )
+        await write_json(path, {"id": node_id, "key": key, "parent": parent})
 
     def _scope_path(self, run_id: str, scope_id: str) -> Path:
         return self.artifacts.run_dir(run_id) / "scopes" / f"{fingerprint(scope_id)}.json"
@@ -764,8 +816,10 @@ class EventLoopRuntime(Runtime):
         definition: FlowDef[..., Any],
         args: tuple[Any, ...],
         kwargs: Mapping[str, Any],
+        *,
+        key: str | None = None,
     ) -> None:
-        await self._check_slot(run_id, scope_id)
+        await self._check_slot(run_id, scope_id, key=key)
         controller = definition.controller
         function = (
             controller.function if isinstance(controller, CoroutineFlowController) else controller
@@ -781,6 +835,7 @@ class EventLoopRuntime(Runtime):
             path,
             {
                 "scope_id": scope_id,
+                "key": key,
                 "name": definition.name,
                 "signature": signature,
                 "inputs": (args, kwargs),
@@ -851,7 +906,7 @@ class EventLoopRuntime(Runtime):
         )
 
     async def _restore_record(self, record: _Record) -> None:
-        await self._check_slot(record.handle.run_id, record.handle.id)
+        await self._check_slot(record.handle.run_id, record.handle.id, key=record.handle.key)
         definition = record.definition
         backend = definition.backend
         backend_name = backend if isinstance(backend, str) else None
@@ -1014,6 +1069,7 @@ class EventLoopRuntime(Runtime):
                     self.artifacts.task_dir(record.handle.run_id, record.handle.id) / "task.json",
                     {
                         "format": 1,
+                        "key": record.handle.key,
                         "view": record.view(),
                         "signature": record.signature,
                         "inputs": record.inputs,
@@ -1189,7 +1245,7 @@ class EventLoopRuntime(Runtime):
                     RunClosedError("Parent flow is closed")
                 )
             else:
-                await self._check_scope(run_id, handle.id, definition, args, kwargs)
+                await self._check_scope(run_id, handle.id, definition, args, kwargs, key=handle.key)
                 self._spawn_scope(run_id, handle, parent, definition, args, kwargs)
         elif kind == "flow_done":
             scope_id, value, error = payload

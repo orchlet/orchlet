@@ -16,6 +16,7 @@ from orchlet import (
     FlowHandle,
     RunHandle,
     Runtime,
+    SubmitOptions,
     TaskHandle,
     agent,
     flow,
@@ -118,6 +119,11 @@ async def undecorated_child(ctx: FlowContext, value: int):
     return await ctx.submit(increment, value)
 
 
+@flow
+async def keyword_inputs(ctx: FlowContext, *, key: int, options: str):
+    return f"{key}:{options}"
+
+
 class CustomController(FlowController[int]):
     async def run(
         self, context: FlowContext, args: tuple[Any, ...], kwargs: Mapping[str, Any]
@@ -162,9 +168,19 @@ async def pipeline(ctx: FlowContext, value: int):
     assert_type(ctx.subflow(child, value), FlowHandle[str])
     assert_type(await ctx.subflow(child, value), str)
     assert_type(await ctx.subflow(undecorated_child, value), int)
+    bound = ctx.with_options(SubmitOptions(key="child"))
+    assert_type(bound, FlowContext)
+    assert_type(bound.subflow(child, value), FlowHandle[str])
+    assert_type(await bound.subflow(undecorated_child, value), int)
+    assert_type(await bound.subflow(keyword_inputs, key=1, options="business"), str)
+    assert_type(bound.submit(increment, value), TaskHandle[int])
+    assert_type(await bound.asubmit(format_number, value), TaskHandle[str])
+    assert_type(ctx.submit(increment, value, options=SubmitOptions(key="work")), TaskHandle[int])
+    assert_type(number.key, str | None)
     child_handle = ctx.subflow(child, value)
     assert_type(child_handle.done, bool)
     assert_type(child_handle.run_id, str)
+    assert_type(child_handle.key, str | None)
     assert_type(await ctx.all_settled([child_handle]), list[Outcome[str]])
     assert_type(await ctx.all_settled([number, child_handle]), list[Outcome[int | str]])
     assert_type(await ctx.map_flows(child, [1, 2]), list[str])
@@ -194,6 +210,7 @@ async def asynchronous_api(runtime: EventLoopRuntime, abstraction: Runtime) -> N
     assert_type(await run, Rating)
     assert_type(await run.wait(), Rating)
     assert_type(run.submit(increment, 1), TaskHandle[int])
+    assert_type(run.submit(increment, 1, options=SubmitOptions(key="external")), TaskHandle[int])
     assert_type(abstraction.start(pipeline, 1), RunHandle[Rating])
     assert_type(runtime.start(undecorated_child, 1), RunHandle[int])
 

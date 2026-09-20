@@ -81,6 +81,39 @@ Input references support lists, tuples, dictionary values, and ordinary dataclas
 
 `ctx.submit()` submits work without guaranteeing an immediate start. TaskDef options such as `priority` and `resources` are fixed when an instance is created. `definition.options(priority=..., metadata=...)` returns a new definition without changing existing instances.
 
+**Stable keys for dynamic nodes.** Give a submission a logical key when its position can change during recovery. Use `SubmitOptions(key=...)` for tasks and a context view for subflows:
+
+```python
+from orchlet import FlowContext, SubmitOptions, flow, task
+
+
+@task
+def review(bug_id: str) -> str:
+    return f"Reviewed {bug_id}"
+
+
+@flow
+async def process_bug(ctx: FlowContext, bug_id: str) -> str:
+    return await ctx.submit(review, bug_id, options=SubmitOptions(key="review"))
+
+
+@flow
+async def bug_reviews(ctx: FlowContext, bug_ids: list[str]) -> list[str]:
+    children = [
+        ctx.with_options(SubmitOptions(key=f"bug:{bug_id}")).subflow(process_bug, bug_id)
+        for bug_id in bug_ids
+    ]
+    return [await child for child in children]
+```
+
+Keys must be nonempty strings, unique among all task and subflow submissions in the same parent scope. Different parents can reuse a key, so every bug branch can have its own `"review"` task. Submitting the same key twice raises `ValueError`, even after the first node finishes; keep its handle to await the same node again. Retries remain attempts of that node.
+
+`ctx.with_options(...)` returns a view of the same scope with immutable submission defaults. It does not change the original context or create a node. `submit()` and `asubmit()` apply those defaults; an explicit `options=` replaces them entirely. Calling `with_options()` again also replaces the defaults. A child flow receives its own ordinary context. Subflows support only the `key` option; `after` and `dependency_policy` apply to task submissions. The view keeps `subflow()` argument checking intact, including business arguments named `key` or `options`.
+
+`run.submit(..., options=SubmitOptions(key=...))` also supports keys for external work. A context view used for `map_flows()` or `map_flows_settled()` gives the batch itself a key; the mapping's `key=` callback still identifies its members. Each submission consumes its key, so create a view with a different key for each independent node or batch.
+
+Keys are scoped by the parent's identity: key every ancestor whose submission position can vary. Unkeyed nodes still use position, and keyed submissions do not advance their positional counters. `TaskHandle.key` and `FlowHandle.key` expose the original key, which is also saved in task and scope metadata. Within a matching unfinished run, compatible successful tasks keep their IDs and checkpoints when reordered. Existing definition, input, dependency, and result checks still apply; reusing a key with incompatible work raises `RecoveryError`. Adding keys to an old positional workflow changes its identities; start that transition with `resume=False`.
+
 **Replace scheduling policies.** The default `PartialOrderScheduler` respects static priority relationships, then uses live weights to choose between equivalent or incomparable candidates. Higher numbers have higher priority by default. Equal weights use READY arrival order.
 
 ```python
@@ -292,7 +325,7 @@ Use `await ctx.map_flows_settled(process, items, key=...)` to return `list[Outco
 
 Both mapping APIs default to `max_in_flight=None`: they impose no additional branch window. Set a positive integer to bound submitted but unfinished subflows. A completed branch frees one place immediately. This window is independent of running-agent resource limits; tasks still use the scheduler, resource allocator, and admission policy. As with other submissions, use `ctx.asubmit()` inside a member when it should wait for global admission capacity instead of receiving `AdmissionError`. A small window also limits which work the scheduler can see. Mapping retains collected results and the runtime retains execution history, even with a bounded window.
 
-Keys must be unique, nonempty strings within a batch; omitted keys use input positions. Explicit keys keep member identities stable when their replay order varies within the reconstructed batch. Existing invocation and input checks still apply. Batch position and submission order inside each member must remain deterministic. Recovery rejects incompatible member inputs, missing previously submitted members, and new keys in a batch whose input was already exhausted. Successful leaf checkpoints are reused; controllers are replayed. Batch records in `batches/` and `batch_*` events preserve membership, status, and error causes.
+Keys must be unique, nonempty strings within a batch; omitted keys use input positions. Explicit keys keep member identities stable when their replay order varies within the reconstructed batch. Existing invocation and input checks still apply. Give the batch a stable parent identity with `ctx.with_options(SubmitOptions(key="bugs")).map_flows(...)` if its own position can vary. Use submission keys inside members for nodes that can be reordered; unkeyed submissions must retain their relative order. Recovery rejects incompatible member inputs, missing previously submitted members, and new keys in a batch whose input was already exhausted. Successful leaf checkpoints are reused; controllers are replayed. Batch records in `batches/` and `batch_*` events preserve membership, status, and error causes.
 
 For custom behavior, implement `BatchFailurePolicy.decide(snapshot)`. `BatchSnapshot` supplies the batch ID, submitted and settled counts, and failures observed so far. Return `BatchDecision.CONTINUE`, `STOP` (stop admission and drain current members), or `CANCEL` (stop admission and cancel unfinished members). Runtime performs state changes and cancellation. Use explicit work-item inputs for changing data; arbitrary strategy state and captured closure state are not checkpointed.
 
@@ -316,7 +349,7 @@ result = runtime.run(pipeline, count=7)
 fresh_runtime = EventLoopRuntime(resume=False)
 ```
 
-Automatic matching uses the working directory, command arguments, flow identity, explicit inputs, and the order of repeated invocations within a runtime. Set `run_key="my-workflow"` to provide a lookup key independently of the command; flow and input checks still apply. Recovery validates saved flow and task signatures, submission positions, inputs, and result checkpoints. Detected mismatches or damaged results raise RecoveryError; use `resume=False` when intentionally starting over. A run that handles its task failures and returns successfully is considered complete.
+Automatic matching uses the working directory, command arguments, flow identity, explicit inputs, and the order of repeated invocations within a runtime. Set `run_key="my-workflow"` to provide a lookup key independently of the command; flow and input checks still apply. Recovery validates saved flow and task signatures, submission identities (keys or positions), inputs, and result checkpoints. Detected mismatches or damaged results raise RecoveryError; use `resume=False` when intentionally starting over. Node keys do not change run matching or reopen completed runs. A run that handles its task failures and returns successfully is considered complete.
 
 The default store uses `.orchlet/runs/<run_id>/`:
 
@@ -334,7 +367,7 @@ Attempt files include `request.json` and `result.json`, plus agent `prompt.txt`,
 
 Use `run.artifacts_dir` or `ctx.artifacts_dir` for the run directory, `handle.artifacts_dir` for a task directory, and `handle.details.artifacts` for the latest attempt's paths. Keep the store's `.index` directory alongside the run directories for automatic discovery. Run locks prevent concurrent processes from continuing the same invocation; on POSIX, recovery also refuses to race an agent subprocess left running after its parent was killed.
 
-Recovery replays Python flow controllers to reconstruct dynamic submissions. Keep submission order deterministic within each flow, pass changing data as explicit inputs, and put side effects inside tasks. An interruption after an external effect but before the success checkpoint can cause that task to execute again, so tasks must tolerate repeated execution. Files written by tasks, closure state, and arbitrary controller or plugin state are not automatically snapshotted. For `keep_open=True`, callers must resubmit external work when reconstructing the run.
+Recovery replays Python flow controllers to reconstruct dynamic submissions. Use stable keys when submission order can vary, keep unkeyed submissions in deterministic relative order within each flow, pass changing data as explicit inputs, and put side effects inside tasks. An interruption after an external effect but before the success checkpoint can cause that task to execute again, so tasks must tolerate repeated execution. Files written by tasks, closure state, and arbitrary controller or plugin state are not automatically snapshotted. For `keep_open=True`, callers must resubmit external work when reconstructing the run.
 
 The default PickleCheckpointCodec preserves Python result types. Results must be serializable, and their class definitions must remain available on restart. Provide `checkpoint_codec=...` with a CheckpointCodec implementation for another representation. Pickle can execute code when loaded, so resume only from trusted local run files. The default `.orchlet/` directory is ignored by this repository's Git configuration.
 

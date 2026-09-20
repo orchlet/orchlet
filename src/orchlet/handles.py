@@ -11,6 +11,7 @@ from .models import TaskResult, TaskView
 
 if TYPE_CHECKING:
     from .definitions import TaskDef
+    from .runtime import SubmitOptions
 
 # Handles only expose their result type; mutable completion state stays internal.
 T_co = TypeVar("T_co", covariant=True)
@@ -63,10 +64,13 @@ class TaskHandle(Generic[T_co]):
         task_id: str,
         run_id: str,
         completion: Completion[T_co],
+        *,
+        key: str | None = None,
     ) -> None:
         self._runtime = runtime
         self.id: str = task_id
         self.run_id: str = run_id
+        self.key: str | None = key
         self._completion: Final = completion
 
     async def result(self) -> T_co:
@@ -109,11 +113,18 @@ class TaskHandle(Generic[T_co]):
 
 class FlowHandle(Generic[T_co]):
     def __init__(
-        self, runtime: RuntimeBridge, scope_id: str, run_id: str, completion: Completion[T_co]
+        self,
+        runtime: RuntimeBridge,
+        scope_id: str,
+        run_id: str,
+        completion: Completion[T_co],
+        *,
+        key: str | None = None,
     ) -> None:
         self._runtime = runtime
         self.id: str = scope_id
         self.run_id: str = run_id
+        self.key: str | None = key
         self._completion: Final = completion
 
     async def result(self) -> T_co:
@@ -175,8 +186,14 @@ class RunHandle(Generic[T_co]):
     def __await__(self) -> Generator[Any, None, T_co]:
         return self.wait().__await__()
 
-    def submit[T](self, definition: TaskDef[..., T], *args: Any, **kwargs: Any) -> TaskHandle[T]:
-        return self._runtime.submit(self.id, None, definition, args, kwargs)
+    def submit[T](
+        self,
+        definition: TaskDef[..., T],
+        *args: Any,
+        options: SubmitOptions | None = None,
+        **kwargs: Any,
+    ) -> TaskHandle[T]:
+        return self._runtime.submit(self.id, None, definition, args, kwargs, options)
 
     async def close_inputs(self) -> None:
         await self._runtime.command("close_inputs", self.id)

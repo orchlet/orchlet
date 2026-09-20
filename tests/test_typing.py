@@ -31,7 +31,7 @@ class Report(TypedDict):
 
 SOURCE = """\
 from dataclasses import dataclass
-from orchlet import EventLoopRuntime, FlowContext, agent, flow, task
+from orchlet import EventLoopRuntime, FlowContext, SubmitOptions, agent, flow, task
 
 @dataclass
 class Rating:
@@ -72,6 +72,10 @@ async def child(ctx: FlowContext, value: int):
     return await ctx.submit(number, value)
 
 @flow
+async def keyword_inputs(ctx: FlowContext, *, key: int, options: str):
+    return f"{key}:{options}"
+
+@flow
 async def pipeline(ctx: FlowContext, value: int):
     count = await ctx.submit(number, value)
     count.upper()  # reject: reportAttributeAccessIssue
@@ -83,6 +87,14 @@ async def pipeline(ctx: FlowContext, value: int):
     await ctx.map_flows(child, ["invalid"])  # reject: reportArgumentType
     await ctx.map_flows_settled(child, ["invalid"])  # reject: reportArgumentType
     await ctx.map_flows(child, [1], key=lambda item: item)  # reject: reportArgumentType
+    SubmitOptions(key=1)  # reject: reportArgumentType
+    bound = ctx.with_options(SubmitOptions(key="branch"))
+    await bound.subflow(child, "invalid")  # reject: reportArgumentType
+    await bound.subflow(child)  # reject: reportCallIssue
+    await bound.subflow(keyword_inputs, key="invalid", options="ok")  # reject: reportArgumentType
+    await bound.subflow(keyword_inputs, key=1, options=3)  # reject: reportArgumentType
+    bound.subflow(child, 1).missing  # reject: reportAttributeAccessIssue
+    (await bound.asubmit(number, 1)).upper()  # reject: reportAttributeAccessIssue
     return rating
 
 def check_runtime(runtime: EventLoopRuntime) -> None:
