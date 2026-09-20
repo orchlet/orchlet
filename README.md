@@ -413,3 +413,5 @@ Every commit runs `ruff format .`, `ruff check .`, and `pyright --warnings`, in 
 The hooks use isolated Python 3.14 environments with pinned checker versions, so commits from VS Code do not depend on activating a shell environment. Python 3.14 must be available when the hook environments are created. Keep the hook's analysis dependencies aligned with `pyproject.toml` when changing project dependencies. Pre-commit temporarily stashes unstaged tracked changes while checking the staged version.
 
 Local hooks can be bypassed with `git commit --no-verify`. To enforce these checks on the shared branch, run them in CI and require the successful CI status in branch protection.
+
+**Acknowledgements.** Orchlet is inspired by [AgentFlow](https://github.com/agentenv/agentflow).
