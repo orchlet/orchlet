@@ -247,7 +247,7 @@ assert_type(runtime.run(ratings), list[Rating])
 
 `result_type` supports classes, parameterized containers such as `list[str]`, unions, `Literal`, and `Annotated`. `TypeForm` from `typing_extensions` preserves these types for the checker; the project enables experimental features for Pylance releases that still require this setting for TypeForm. Result types and validator callbacks are linked when `result_type` is supplied. Without it, annotate a task's validation callback explicitly; a decorator factory cannot infer its callback parameter from a function it has not received yet.
 
-`run()`, `arun()`, and `subflow()` also check flow arguments. `submit()`, `asubmit()`, `map()`, and external submissions preserve result types but accept dynamically resolved inputs: Python's typing system cannot express replacing every nested input value with a task handle. `start()` also accepts dynamic arguments because it adds the `keep_open` option. Metadata, backend payloads, and task lookup by a string ID have dynamic types. These boundaries are explicit; strict mode does not imply that all uses of `Any` are forbidden.
+`run()`, `arun()`, and `subflow()` also check flow arguments. `map_flows()` and `map_flows_settled()` check the work-item type and infer the result type. `submit()`, `asubmit()`, `map()`, and external submissions preserve result types but accept dynamically resolved inputs: Python's typing system cannot express replacing every nested input value with a task handle. `start()` also accepts dynamic arguments because it adds the `keep_open` option. Metadata, backend payloads, and task lookup by a string ID have dynamic types. These boundaries are explicit; strict mode does not imply that all uses of `Any` are forbidden.
 
 Run `pyright` after installing the dev extra. It checks the library, examples, tests, and the `assert_type` regressions in `typecheck/inference.py`. The test suite also checks that invalid result access and incorrect flow arguments produce diagnostics.
 
@@ -261,7 +261,42 @@ A task publishes success only after execution, any configured decoding and valid
 
 **Results, failures, and events.** `await handle` returns the business value. `handle.snapshot` exposes task state. `handle.details` exposes TaskResult, including attempts, raw_text, stdout, stderr, session_id, exit_code, artifacts, and error. Each Attempt retains its own diagnostics and artifact paths. Execution failures raise TaskFailed with the original exception in cause. Skipped, cancelled, and rejected tasks have corresponding error types.
 
-After catching a task failure, a flow can submit new repair tasks. A normally returning flow still joins its children. By default, an unhandled failure fails its scope and cancels remaining children. `ctx.all_settled(handles)` returns Outcome objects for explicitly collecting partial results. `CollectFailures` changes scope handling of unobserved errors; directly awaiting a failed handle still raises.
+After catching a task failure, a flow can submit new repair tasks. A normally returning flow still joins its children. By default, an unhandled failure fails its scope and cancels remaining children. `ctx.all_settled(handles)` accepts task and flow handles from the same runtime and run, and returns typed Outcome objects for explicitly collecting partial results. `Outcome.node_id` identifies either kind of member; the original `task_id` attribute remains available. `CollectFailures` changes scope handling of unobserved errors; directly awaiting a failed handle still raises.
+
+**Subflow batches.** Map a flow taking one typed work item over an iterable. Each branch advances independently, and returned results follow input order. A work-item dataclass can carry several inputs.
+
+```python
+from orchlet import FlowContext, flow, task
+
+
+@task
+async def double(value: int) -> int:
+    return value * 2
+
+
+@flow
+async def process(ctx: FlowContext, value: int) -> int:
+    return await ctx.submit(double, value)
+
+
+@flow
+async def pipeline(ctx: FlowContext) -> list[int]:
+    return await ctx.map_flows(process, range(10), key=str)
+```
+
+`map_flows()` returns `list[T]` on success. Its default `WaitAllThenRaise()` policy continues submitting members and waits for all of them before raising `BatchFailed`. Each entry in `error.failures` contains the member's `key`, `flow_id`, original `error`, and a `task_id` when the cause identifies a failing task. The aggregate's cause is an `ExceptionGroup`. A successful `False` or `None` value is an ordinary success.
+
+Pass `failure=FailFast()` to stop submitting members after a terminal member failure, cancel the batch's unfinished members, and wait for their cleanup. Task retries finish before the batch sees a failure. Batch cancellation affects its own descendants; an uncaught aggregate then propagates through the usual parent-scope failure rules.
+
+Use `await ctx.map_flows_settled(process, items, key=...)` to return `list[Outcome[T]]` containing both successful values and ordinary execution failures. Batch outcomes include their logical `key`. Iterator errors, invalid keys, and caller cancellation still propagate. A flow that handles member failures and returns normally is successful, so repeating that completed run starts fresh.
+
+Both mapping APIs default to `max_in_flight=None`: they impose no additional branch window. Set a positive integer to bound submitted but unfinished subflows. A completed branch frees one place immediately. This window is independent of running-agent resource limits; tasks still use the scheduler, resource allocator, and admission policy. As with other submissions, use `ctx.asubmit()` inside a member when it should wait for global admission capacity instead of receiving `AdmissionError`. A small window also limits which work the scheduler can see. Mapping retains collected results and the runtime retains execution history, even with a bounded window.
+
+Keys must be unique, nonempty strings within a batch; omitted keys use input positions. Explicit keys keep member identities stable when their replay order varies within the reconstructed batch. Existing invocation and input checks still apply. Batch position and submission order inside each member must remain deterministic. Recovery rejects incompatible member inputs, missing previously submitted members, and new keys in a batch whose input was already exhausted. Successful leaf checkpoints are reused; controllers are replayed. Batch records in `batches/` and `batch_*` events preserve membership, status, and error causes.
+
+For custom behavior, implement `BatchFailurePolicy.decide(snapshot)`. `BatchSnapshot` supplies the batch ID, submitted and settled counts, and failures observed so far. Return `BatchDecision.CONTINUE`, `STOP` (stop admission and drain current members), or `CANCEL` (stop admission and cancel unfinished members). Runtime performs state changes and cancellation. Use explicit work-item inputs for changing data; arbitrary strategy state and captured closure state are not checkpointed.
+
+`FlowHandle` exposes `run_id`, `done`, and `cancel()`. Cancellation requests propagate through descendants; await the handle or collect it with `all_settled()` to wait for cleanup. Cancelling a mapping call also cancels its owned batch and waits for cleanup. Cancelling an ordinary handle waiter merely detaches that waiter.
 
 MemoryStateStore and MemoryEventJournal retain snapshots and events during execution. `JsonlJournal(path)` is an optional diagnostic journal. Use `runtime.journal.read()` to inspect events from the current runtime instance. The artifact store separately saves checkpoints and a run's `events.jsonl`, which retains event history across restarts. An event journal alone is not a recovery checkpoint. Preemption and distributed execution are not currently supported.
 
@@ -290,6 +325,7 @@ The default store uses `.orchlet/runs/<run_id>/`:
 | `run.json` | Run status, inputs, metrics, timestamps, and errors |
 | `events.jsonl` | Scheduling, execution, retry, and recovery events |
 | `scopes/`, `slots/` | Flow and submission metadata for replay checks |
+| `batches/` | Batch configuration, stable member identities, outcomes, and failure causes |
 | `tasks/<task>/task.json` | Task state, inputs, dependencies, and attempt history |
 | `tasks/<task>/value.pickle` | Successful task value serialized by the checkpoint codec |
 | `tasks/<task>/attempts/001/`, `002/`, ... | Separate files for every execution attempt |
@@ -308,6 +344,7 @@ The default PickleCheckpointCodec preserves Python result types. Results must be
 | --- | --- |
 | `definitions.py`, `runtime.py` | FlowController, Runtime, TaskDef, FlowContext |
 | `inputs.py`, `policies.py` | InputResolver, DependencyPolicy, AdmissionPolicy, RetryPolicy, FailurePolicy |
+| `batches.py`, `policies.py` | BatchFailurePolicy, WaitAllThenRaise, FailFast |
 | `priorities.py`, `weights.py`, `schedulers.py` | PriorityOrder, WeightModel, ReadyIndex, Scheduler |
 | `resources.py` | ResourceAllocator |
 | `runners.py`, `backends.py` | Runner, AgentBackend |

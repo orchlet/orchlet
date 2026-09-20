@@ -53,6 +53,8 @@ class Subflow(Protocol):
         definition: FlowDef[..., T] | Callable[..., Awaitable[T]],
         args: tuple[Any, ...],
         kwargs: Mapping[str, Any],
+        *,
+        key: str | None = None,
     ) -> FlowHandle[T]: ...
 
 
@@ -67,3 +69,4 @@ class RuntimeBridge:
     completion: Callable[[str], Completion[Any]]
     admission: Callable[[str], asyncio.Future[None]]
     artifacts: ArtifactStore
+    owns: Callable[[str, TaskHandle[Any] | FlowHandle[Any]], bool]

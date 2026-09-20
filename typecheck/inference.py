@@ -162,6 +162,18 @@ async def pipeline(ctx: FlowContext, value: int):
     assert_type(ctx.subflow(child, value), FlowHandle[str])
     assert_type(await ctx.subflow(child, value), str)
     assert_type(await ctx.subflow(undecorated_child, value), int)
+    child_handle = ctx.subflow(child, value)
+    assert_type(child_handle.done, bool)
+    assert_type(child_handle.run_id, str)
+    assert_type(await ctx.all_settled([child_handle]), list[Outcome[str]])
+    assert_type(await ctx.all_settled([number, child_handle]), list[Outcome[int | str]])
+    assert_type(await ctx.map_flows(child, [1, 2]), list[str])
+    assert_type(await ctx.map_flows(undecorated_child, [1, 2]), list[int])
+    assert_type(
+        await ctx.map_flows(child, [1, 2], key=lambda item: str(assert_type(item, int))),
+        list[str],
+    )
+    assert_type(await ctx.map_flows_settled(child, [1, 2]), list[Outcome[str]])
     custom = FlowDef[[], int](CustomController(), "custom")
     assert_type(await ctx.subflow(custom), int)
     return await ctx.submit(rate, "A")

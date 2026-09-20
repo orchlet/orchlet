@@ -4,8 +4,28 @@ from collections.abc import Sequence
 from math import isfinite
 from typing import cast
 
-from .contracts import AdmissionPolicy, DependencyPolicy, FailurePolicy, RetryPolicy
-from .models import Attempt, Gate, RetryDecision, TaskState, TaskView
+from .contracts import (
+    AdmissionPolicy,
+    BatchFailurePolicy,
+    DependencyPolicy,
+    FailurePolicy,
+    RetryPolicy,
+)
+from .models import Attempt, BatchDecision, BatchSnapshot, Gate, RetryDecision, TaskState, TaskView
+
+
+class WaitAllThenRaise(BatchFailurePolicy):
+    """Finish the entire batch before reporting its execution failures."""
+
+    def decide(self, snapshot: BatchSnapshot) -> BatchDecision:
+        return BatchDecision.CONTINUE
+
+
+class FailFast(BatchFailurePolicy):
+    """Stop admission and cancel unfinished members after a terminal failure."""
+
+    def decide(self, snapshot: BatchSnapshot) -> BatchDecision:
+        return BatchDecision.CANCEL if snapshot.failures else BatchDecision.CONTINUE
 
 
 class AllSuccessful(DependencyPolicy):

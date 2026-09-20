@@ -14,6 +14,8 @@ from .models import (
     AllocationPlan,
     Attempt,
     AttemptContext,
+    BatchDecision,
+    BatchSnapshot,
     ExecutionRequest,
     ExecutionResult,
     Gate,
@@ -145,6 +147,13 @@ class RetryPolicy(ABC):
 class FailurePolicy(ABC):
     @abstractmethod
     def fail_scope(self, unobserved_errors: Sequence[BaseException]) -> bool: ...
+
+
+class BatchFailurePolicy(ABC):
+    """Decide whether to admit more members and whether to cancel pending members."""
+
+    @abstractmethod
+    def decide(self, snapshot: BatchSnapshot) -> BatchDecision: ...
 
 
 class Runner(ABC):

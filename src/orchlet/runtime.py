@@ -29,11 +29,13 @@ from .artifacts import (
     write_text,
 )
 from .checkpoints import PickleCheckpointCodec, callable_identity, fingerprint
+from .batches import BatchController, error_metadata, failed_task
 from .clocks import MonotonicClock
 from .contracts import (
     AdmissionPolicy,
     AgentBackend,
     ArtifactStore,
+    BatchFailurePolicy,
     CheckpointCodec,
     Clock,
     DependencyPolicy,
@@ -61,7 +63,15 @@ from .errors import (
     TaskFailed,
 )
 from .events import AsyncioEventTransport, MemoryEventJournal
-from .handles import FlowHandle, OutputRef, RunHandle, TaskHandle, await_shared, quiet_future
+from .handles import (
+    FlowHandle,
+    OutputRef,
+    RunHandle,
+    TaskHandle,
+    await_shared,
+    observe_handles,
+    quiet_future,
+)
 from .inputs import NestedInputResolver
 from .logging import log_event, log_runtime_error
 from .models import (
@@ -81,7 +91,7 @@ from .models import (
     TaskState,
     TaskView,
 )
-from .policies import AllSuccessful, BoundedAdmission, FailScope, NoRetry
+from .policies import AllSuccessful, BoundedAdmission, FailScope, NoRetry, WaitAllThenRaise
 from .resources import TokenResourceAllocator
 from .runners import AgentRunner, CancellationToken, PythonRunner
 from .schedulers import PartialOrderScheduler
@@ -180,6 +190,7 @@ class _Scope:
     settled: bool = False
     value: Any = None
     error: BaseException | None = None
+    cancel_requested: bool = False
 
 
 @dataclass
@@ -245,18 +256,88 @@ class FlowContext:
         self._check()
         return self._runtime.subflow(self.run_id, self.scope_id, definition, args, kwargs)
 
-    async def all_settled[T](self, handles: Iterable[TaskHandle[T]]) -> list[Outcome[T]]:
-        handles = tuple(handles)
-        for handle in handles:
-            self._runtime.completion(handle.id).observed = True
+    async def all_settled[T](
+        self, handles: Iterable[TaskHandle[T] | FlowHandle[T]]
+    ) -> list[Outcome[T]]:
+        """Collect member failures without swallowing cancellation of the caller."""
+        self._check()
+        handles = observe_handles(self._runtime, self.run_id, handles)
 
-        async def settle(handle: TaskHandle[T]) -> Outcome[T]:
+        async def settle(handle: TaskHandle[T] | FlowHandle[T]) -> Outcome[T]:
             try:
                 return Outcome(handle.id, value=await handle.result())
             except Exception as exc:
                 return Outcome(handle.id, error=exc)
 
         return list(await asyncio.gather(*(settle(handle) for handle in handles)))
+
+    async def map_flows[I, T](
+        self,
+        definition: FlowDef[[I], T] | Callable[[FlowContext, I], Awaitable[T]],
+        iterable: Iterable[I],
+        *,
+        key: Callable[[I], str] | None = None,
+        max_in_flight: int | None = None,
+        failure: BatchFailurePolicy | None = None,
+    ) -> list[T]:
+        """Map one work item per subflow; return values or raise BatchFailed.
+
+        Members execute independently and results preserve input order. The
+        optional window limits unfinished branches, not running agents. Use a
+        stable key to associate each work item with its checkpoints on replay.
+        """
+        outcomes = await self._map_flow_outcomes(
+            definition,
+            iterable,
+            key,
+            max_in_flight,
+            failure if failure is not None else WaitAllThenRaise(),
+            False,
+        )
+        return [cast(T, outcome.value) for outcome in outcomes]
+
+    async def map_flows_settled[I, T](
+        self,
+        definition: FlowDef[[I], T] | Callable[[FlowContext, I], Awaitable[T]],
+        iterable: Iterable[I],
+        *,
+        key: Callable[[I], str] | None = None,
+        max_in_flight: int | None = None,
+    ) -> list[Outcome[T]]:
+        """Wait for every member and return its outcome, including ordinary failures."""
+        return await self._map_flow_outcomes(
+            definition, iterable, key, max_in_flight, WaitAllThenRaise(), True
+        )
+
+    async def _map_flow_outcomes[I, T](
+        self,
+        definition: FlowDef[[I], T] | Callable[[FlowContext, I], Awaitable[T]],
+        iterable: Iterable[I],
+        key: Callable[[I], str] | None,
+        max_in_flight: int | None,
+        failure: BatchFailurePolicy,
+        collect_errors: bool,
+    ) -> list[Outcome[T]]:
+        self._check()
+        child = (
+            cast(FlowDef[[I], T], definition)
+            if isinstance(definition, FlowDef)
+            else FlowDef(CoroutineFlowController(definition), definition.__name__)
+        )
+        batch = FlowDef[[], list[Outcome[T]]](
+            BatchController(
+                self._runtime, child, iterable, key, max_in_flight, failure, collect_errors
+            ),
+            f"{child.name}_batch",
+        )
+        handle = self.subflow(batch)
+        observe_handles(self._runtime, self.run_id, [handle])
+        try:
+            return await handle
+        except asyncio.CancelledError:
+            await handle.cancel()
+            await asyncio.gather(handle.result(), return_exceptions=True)
+            raise
 
     async def map[T](
         self, definition: TaskDef[..., T], iterable: Iterable[Any], *, max_in_flight: int = 32
@@ -388,11 +469,15 @@ class EventLoopRuntime(Runtime):
             self._completions.__getitem__,
             self._admissions.__getitem__,
             self.artifacts,
+            self._owns,
         )
         self._runs: dict[str, _Run] = {}
         self._run_handles: dict[str, RunHandle[Any]] = {}
         self._scope_handles: dict[str, FlowHandle[Any]] = {}
         self._scopes: dict[str, _Scope] = {}
+        self._batches: dict[str, dict[str, Any]] = {}
+        self._batch_replay: dict[str, tuple[set[str], bool]] = {}
+        self._batch_members: dict[str, set[str]] = {}
         self._dependents: dict[str, dict[str, None]] = {}
         self._dirty: dict[str, None] = {}
         self._pending: dict[str, int] = {}
@@ -414,6 +499,14 @@ class EventLoopRuntime(Runtime):
         self.transport.open()
         self._engine = loop.create_task(self._drive(), name="orchlet-runtime")
 
+    def _owns(self, run_id: str, handle: TaskHandle[Any] | FlowHandle[Any]) -> bool:
+        registered = (
+            self._handles.get(handle.id)
+            if isinstance(handle, TaskHandle)
+            else self._scope_handles.get(handle.id)
+        )
+        return handle.run_id == run_id and registered is handle
+
     def _post(self, message: _Message) -> None:
         if message.run_id is not None:
             self._pending[message.run_id] = self._pending.get(message.run_id, 0) + 1
@@ -429,7 +522,7 @@ class EventLoopRuntime(Runtime):
     async def _command(
         self, kind: str, run_id: str | None = None, task_id: str | None = None, payload: Any = None
     ) -> None:
-        if self._engine is None or self._engine.done():
+        if self._engine is None or self._engine.done() or self._aborting:
             raise RunClosedError("Runtime has no active runs")
         if self._loop is not asyncio.get_running_loop():
             raise RuntimeError("Control commands must use the Runtime's event loop")
@@ -562,7 +655,7 @@ class EventLoopRuntime(Runtime):
     ) -> TaskHandle[T]:
         if not isinstance(cast(object, definition), TaskDef):
             raise TypeError("Submit a @task/@agent definition; use ctx.subflow for flows")
-        if self._engine is None or self._engine.done():
+        if self._engine is None or self._engine.done() or self._aborting:
             raise RunClosedError("Runtime has no active run")
         if self._loop is not asyncio.get_running_loop():
             raise RuntimeError("Submit on the Runtime's event loop")
@@ -614,16 +707,30 @@ class EventLoopRuntime(Runtime):
         definition: FlowDef[..., T] | Callable[..., Awaitable[T]],
         args: tuple[Any, ...],
         kwargs: Mapping[str, Any],
+        *,
+        key: str | None = None,
     ) -> FlowHandle[T]:
+        if self._engine is None or self._engine.done() or self._aborting:
+            raise RunClosedError("Runtime has no active run")
+        if key is not None and parent in self._batch_replay:
+            previous_keys, complete = self._batch_replay[parent]
+            if complete and key not in previous_keys:
+                raise RecoveryError(f"New member {key!r} in a previously exhausted batch")
         definition = (
             cast(FlowDef[..., T], definition)
             if isinstance(definition, FlowDef)
             else FlowDef[..., T](CoroutineFlowController[..., T](definition), definition.__name__)
         )
-        scope_id = self._next_id(parent, "flow", definition.name)
+        scope_id = (
+            self._next_id(parent, "flow", definition.name)
+            if key is None
+            else f"{parent}/flow-key:{quote(key, safe='')}:{quote(definition.name, safe='')}"
+        )
+        if scope_id in self._scope_handles:
+            raise ValueError(f"Duplicate flow identity: {scope_id}")
         completion = Completion[T](quiet_future(asyncio.get_running_loop().create_future()))
         self._completions[scope_id] = completion
-        handle = FlowHandle[T](scope_id, completion)
+        handle = FlowHandle[T](self._bridge, scope_id, run_id, completion)
         self._scope_handles[scope_id] = handle
         self._post(_Message("subflow", run_id, payload=(handle, parent, definition, args, kwargs)))
         return handle
@@ -678,6 +785,69 @@ class EventLoopRuntime(Runtime):
                 "signature": signature,
                 "inputs": (args, kwargs),
             },
+        )
+
+    async def _batch_event(self, run_id: str, batch_id: str, data: Mapping[str, Any]) -> None:
+        """Journal batch membership without caching controller stacks or results."""
+        if self._scopes[batch_id].run_id != run_id:
+            raise ValueError("Batch belongs to another run")
+        kind = data["kind"]
+        path = self.artifacts.run_dir(run_id) / "batches" / f"{fingerprint(batch_id)}.json"
+        if kind == "started":
+            previous = read_json(path) if run_id in self._resumed and path.exists() else {}
+            if previous and previous.get("signature") != data["signature"]:
+                raise RecoveryError(f"Batch configuration changed at {batch_id}")
+            self._batch_replay[batch_id] = (
+                set(previous.get("members", {})),
+                bool(previous.get("manifest_complete", False)),
+            )
+            self._batch_members[batch_id] = set()
+            self._batches[batch_id] = {
+                **data,
+                "batch_id": batch_id,
+                "status": "running",
+                "exhausted": False,
+                "manifest_complete": previous.get("manifest_complete", False),
+                "members": previous.get("members", {}),
+            }
+        else:
+            metadata = self._batches[batch_id]
+            members: dict[str, Any] = metadata["members"]
+            if kind == "member_submitted":
+                key = data["key"]
+                previous_keys, complete = self._batch_replay[batch_id]
+                if complete and key not in previous_keys:
+                    raise RecoveryError(f"New member {key!r} in a previously exhausted batch")
+                self._batch_members[batch_id].add(key)
+                members[key] = {**data, "status": "pending"}
+            elif kind == "member_finished":
+                members[data["key"]].update(data)
+            elif kind == "input_exhausted":
+                previous_keys, _ = self._batch_replay[batch_id]
+                if not previous_keys <= self._batch_members[batch_id]:
+                    raise RecoveryError(f"Previously submitted members disappeared from {batch_id}")
+                metadata["exhausted"] = metadata["manifest_complete"] = True
+            elif kind == "finished":
+                previous_keys, _ = self._batch_replay[batch_id]
+                if data["exhausted"] and not previous_keys <= self._batch_members[batch_id]:
+                    raise RecoveryError(f"Previously submitted members disappeared from {batch_id}")
+                metadata.update(data)
+                metadata["manifest_complete"] |= data["exhausted"]
+                for key in self._batch_members[batch_id]:
+                    member = members[key]
+                    future = self._completions[member["flow_id"]].future
+                    if member["status"] == "pending" and future.done():
+                        error = future.exception()
+                        member.update(
+                            status="succeeded" if error is None else "failed",
+                            error=error_metadata(error),
+                            failed_task_id=failed_task(error) if error is not None else None,
+                        )
+            else:
+                raise ValueError(f"Unknown batch event: {kind}")
+        await write_json(path, self._batches[batch_id])
+        await self._emit(
+            f"batch_{kind}", run_id, batch_id, **{k: v for k, v in data.items() if k != "kind"}
         )
 
     async def _restore_record(self, record: _Record) -> None:
@@ -975,7 +1145,7 @@ class EventLoopRuntime(Runtime):
         if kind == "start_run":
             handle, definition, args, kwargs, keep_open = payload
             completion = Completion[Any](quiet_future(asyncio.get_running_loop().create_future()))
-            root = FlowHandle[Any](f"{run_id}/root", completion)
+            root = FlowHandle[Any](self._bridge, f"{run_id}/root", run_id, completion)
             self._completions[root.id] = completion
             self._runs[run_id] = _Run(
                 handle,
@@ -1004,7 +1174,7 @@ class EventLoopRuntime(Runtime):
             else:
                 scope = self._scopes[record.scope_id]
                 scope.tasks.append(task_id)
-                closed = scope.flow_done
+                closed = scope.flow_done or scope.cancel_requested
             if closed or run.cancelled or run.handle.done:
                 await self._finish(
                     record, TaskState.CANCELLED, error=RunClosedError("Submission scope is closed")
@@ -1014,7 +1184,7 @@ class EventLoopRuntime(Runtime):
         elif kind == "subflow":
             handle, parent, definition, args, kwargs = payload
             scope = self._scopes[parent]
-            if scope.flow_done or self._runs[run_id].cancelled:
+            if scope.flow_done or scope.cancel_requested or self._runs[run_id].cancelled:
                 self._completions[handle.id].future.set_exception(
                     RunClosedError("Parent flow is closed")
                 )
@@ -1024,6 +1194,8 @@ class EventLoopRuntime(Runtime):
         elif kind == "flow_done":
             scope_id, value, error = payload
             scope = self._scopes[scope_id]
+            if scope.cancel_requested:
+                error = TaskCancelled("Flow cancelled")
             scope.flow_done, scope.value, scope.error = True, value, error
             await write_json(
                 self._scope_path(run_id, scope_id).with_suffix(".result.json"),
@@ -1055,15 +1227,21 @@ class EventLoopRuntime(Runtime):
             if record.handle.run_id != run_id:
                 raise ValueError("Task belongs to another run")
             await self._cancel_record(record)
+        elif kind == "cancel_scope":
+            assert task_id is not None
+            scope = self._scopes[task_id]
+            if scope.run_id != run_id:
+                raise ValueError("Flow belongs to another run")
+            await self._cancel_scope(scope)
+        elif kind == "batch_event":
+            assert task_id is not None
+            await self._batch_event(run_id, task_id, payload)
         elif kind == "cancel_run":
             run = self._runs[run_id]
             if not run.handle.done:
                 run.cancelled, run.keep_open = True, False
                 root = self._scopes[run.root]
-                if not root.flow_done:
-                    assert root.worker is not None
-                    root.worker.cancel()
-                await self._cancel_scope_children(root)
+                await self._cancel_scope(root)
                 for node_id in run.external:
                     await self._cancel_record(self._records[node_id])
         elif kind == "close_inputs":
@@ -1540,11 +1718,17 @@ class EventLoopRuntime(Runtime):
         for node_id in scope.tasks:
             await self._cancel_record(self._records[node_id])
         for scope_id in scope.children:
-            child = self._scopes[scope_id]
-            if not child.flow_done:
-                assert child.worker is not None
-                child.worker.cancel()
-            await self._cancel_scope_children(child)
+            await self._cancel_scope(self._scopes[scope_id])
+
+    async def _cancel_scope(self, scope: _Scope) -> None:
+        if scope.settled or scope.cancel_requested:
+            return
+        scope.cancel_requested = True
+        scope.error = TaskCancelled("Flow cancelled")
+        if not scope.flow_done:
+            assert scope.worker is not None
+            scope.worker.cancel()
+        await self._cancel_scope_children(scope)
 
     async def _settle_scopes(self) -> None:
         changed = True
@@ -1611,6 +1795,12 @@ class EventLoopRuntime(Runtime):
             if scope.worker is not None and not scope.worker.done():
                 scope.worker.cancel()
                 workers.append(scope.worker)
+        # Coordinators may join their children during cancellation. Unblock those
+        # joins before waiting for workers; leaf cleanup still precedes run completion.
+        for handle in self._scope_handles.values():
+            future = self._completions[handle.id].future
+            if not future.done():
+                future.set_exception(error)
         for record in self._records.values():
             if record.timer is not None:
                 record.timer.cancel()

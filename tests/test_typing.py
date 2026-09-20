@@ -80,6 +80,9 @@ async def pipeline(ctx: FlowContext, value: int):
     rate.options(priorty=3)  # reject: reportCallIssue
     await ctx.subflow(child, "invalid")  # reject: reportArgumentType
     await ctx.subflow(child)  # reject: reportCallIssue
+    await ctx.map_flows(child, ["invalid"])  # reject: reportArgumentType
+    await ctx.map_flows_settled(child, ["invalid"])  # reject: reportArgumentType
+    await ctx.map_flows(child, [1], key=lambda item: item)  # reject: reportArgumentType
     return rating
 
 def check_runtime(runtime: EventLoopRuntime) -> None:

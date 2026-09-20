@@ -3,6 +3,7 @@
 from .contracts import (
     AdmissionPolicy,
     AgentBackend,
+    BatchFailurePolicy,
     ArtifactStore,
     CheckpointCodec,
     Clock,
@@ -30,12 +31,23 @@ from .artifacts import FileArtifactStore
 from .checkpoints import PickleCheckpointCodec
 from .definitions import FlowDef, TaskDef, agent, flow, task
 from .handles import FlowHandle, RunHandle, TaskHandle
+from .errors import BatchFailed
+from .models import BatchDecision, BatchFailure, BatchSnapshot, Outcome
+from .policies import FailFast, WaitAllThenRaise
 from .logging import configure_logging, get_logger
 from .runtime import EventLoopRuntime, FlowContext, SubmitOptions
 
 __all__ = [
     "AdmissionPolicy",
     "AgentBackend",
+    "BatchFailurePolicy",
+    "BatchDecision",
+    "BatchFailure",
+    "BatchSnapshot",
+    "BatchFailed",
+    "Outcome",
+    "FailFast",
+    "WaitAllThenRaise",
     "ArtifactStore",
     "CheckpointCodec",
     "FileArtifactStore",

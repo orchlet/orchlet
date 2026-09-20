@@ -223,10 +223,38 @@ class Outcome[T_co]:
     task_id: str
     value: T_co | None = None
     error: BaseException | None = None
+    key: str | None = None
+
+    @property
+    def node_id(self) -> str:
+        """The task or flow ID; task_id remains available for compatibility."""
+        return self.task_id
 
     @property
     def succeeded(self) -> bool:
         return self.error is None
+
+
+@dataclass(frozen=True)
+class BatchFailure:
+    key: str
+    flow_id: str
+    error: Exception
+    task_id: str | None = None
+
+
+@dataclass(frozen=True)
+class BatchSnapshot:
+    batch_id: str
+    submitted: int
+    settled: int
+    failures: tuple[BatchFailure, ...]
+
+
+class BatchDecision(Enum):
+    CONTINUE = "continue"
+    STOP = "stop"
+    CANCEL = "cancel"
 
 
 @dataclass(frozen=True)

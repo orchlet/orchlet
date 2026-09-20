@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Final, Generic, TypeVar, cast
 
 from ._bridges import Completion, RuntimeBridge
 from .models import TaskResult, TaskView
@@ -108,8 +108,12 @@ class TaskHandle(Generic[T_co]):
 
 
 class FlowHandle(Generic[T_co]):
-    def __init__(self, scope_id: str, completion: Completion[T_co]) -> None:
+    def __init__(
+        self, runtime: RuntimeBridge, scope_id: str, run_id: str, completion: Completion[T_co]
+    ) -> None:
+        self._runtime = runtime
         self.id: str = scope_id
+        self.run_id: str = run_id
         self._completion: Final = completion
 
     async def result(self) -> T_co:
@@ -125,6 +129,30 @@ class FlowHandle(Generic[T_co]):
 
     def __await__(self) -> Generator[Any, None, T_co]:
         return self.result().__await__()
+
+    @property
+    def done(self) -> bool:
+        return self._completion.future.done()
+
+    async def cancel(self) -> None:
+        """Request cancellation; await the handle to wait for descendant cleanup."""
+        if not self.done:
+            await self._runtime.command("cancel_scope", self.run_id, self.id)
+
+
+def observe_handles[T](
+    runtime: RuntimeBridge, run_id: str, handles: Iterable[TaskHandle[T] | FlowHandle[T]]
+) -> tuple[TaskHandle[T] | FlowHandle[T], ...]:
+    """Validate the entire collection before taking responsibility for its errors."""
+    members = tuple(handles)
+    for handle in members:
+        if not isinstance(cast(object, handle), (TaskHandle, FlowHandle)):
+            raise TypeError("Expected a task or flow handle")
+        if not runtime.owns(run_id, handle):
+            raise ValueError("Handles must belong to this Runtime and run")
+    for handle in members:
+        runtime.completion(handle.id).observed = True
+    return members
 
 
 class RunHandle(Generic[T_co]):

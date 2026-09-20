@@ -1,5 +1,9 @@
 """Public errors. Execution failures retain the original exception as their cause."""
 
+from collections.abc import Sequence
+
+from .models import BatchFailure
+
 
 class OrchletError(Exception):
     pass
@@ -39,6 +43,21 @@ class TaskFailed(OrchletError):
 
 class TaskCancelled(OrchletError):
     pass
+
+
+class BatchFailed(OrchletError):
+    """Terminal member failures, including their logical keys and original causes."""
+
+    def __init__(self, batch_id: str, failures: Sequence[BatchFailure]) -> None:
+        self.batch_id: str = batch_id
+        self.failures: tuple[BatchFailure, ...] = tuple(failures)
+        if not self.failures:
+            raise ValueError("BatchFailed requires at least one member failure")
+        keys = ", ".join(failure.key for failure in self.failures)
+        super().__init__(f"{len(self.failures)} batch members failed ({keys})")
+        self.__cause__: BaseException | None = ExceptionGroup(
+            f"Failures in {batch_id}", [failure.error for failure in self.failures]
+        )
 
 
 class DependencyFailed(OrchletError):

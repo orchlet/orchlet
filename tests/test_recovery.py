@@ -15,6 +15,7 @@ from typing import Any
 
 from orchlet import EventLoopRuntime, FileArtifactStore, FlowContext, agent, flow, task
 from orchlet.backends import CommandBackend
+from orchlet.artifacts import read_json
 from orchlet.errors import RecoveryError, TaskCancelled, TaskFailed
 from orchlet.handles import TaskHandle
 from orchlet.policies import ExponentialRetry
@@ -230,6 +231,72 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipUnless(os.name == "posix", "hard process termination requires POSIX")
 class ProcessRecoveryTests(unittest.TestCase):
+    def test_same_command_after_kill_resumes_batch_members(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "batch.py"
+            script.write_text("""import asyncio
+from pathlib import Path
+from orchlet import EventLoopRuntime, FlowContext, flow, task
+
+@task
+async def review(value: int) -> int:
+    with Path("calls").open("a") as stream:
+        stream.write(f"review-{value}\\n")
+    return value
+
+@task
+async def fix(value: int) -> int:
+    Path(f"entered-{value}").touch()
+    if not Path("continue").exists():
+        await asyncio.Event().wait()
+    return value + 10
+
+@flow
+async def branch(ctx: FlowContext, value: int) -> int:
+    return await ctx.submit(fix, await ctx.submit(review, value))
+
+@flow
+async def pipeline(ctx: FlowContext) -> list[int]:
+    return await ctx.map_flows(branch, range(3), key=str)
+
+print(EventLoopRuntime().run(pipeline))
+""")
+            command = [sys.executable, str(script)]
+            child = subprocess.Popen(
+                command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            try:
+                import time
+
+                deadline = time.monotonic() + 8
+                while not all((root / f"entered-{value}").exists() for value in range(3)):
+                    if child.poll() is not None or time.monotonic() > deadline:
+                        self.fail("Batch did not reach all interruption points")
+                    time.sleep(0.01)
+                child.kill()
+                child.communicate(timeout=5)
+                (root / "continue").touch()
+                resumed = subprocess.run(
+                    command, cwd=root, capture_output=True, text=True, timeout=10
+                )
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                self.assertEqual(resumed.stdout.strip(), "[10, 11, 12]")
+                self.assertEqual(
+                    sorted((root / "calls").read_text().splitlines()),
+                    ["review-0", "review-1", "review-2"],
+                )
+                runs = list((root / ".orchlet/runs").glob("*/run.json"))
+                self.assertEqual(len(runs), 1)
+                self.assertEqual(json.loads(runs[0].read_text())["status"], "succeeded")
+                batch = read_json(next((runs[0].parent / "batches").glob("*.json")))
+                self.assertEqual(batch["status"], "settled")
+                self.assertEqual(set(batch["members"]), {"0", "1", "2"})
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate(timeout=5)
+
     def test_same_command_after_kill_reuses_committed_results(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
